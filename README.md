@@ -1,5 +1,20 @@
 # hpc-consensus
 
+## License and contributing
+
+This project's original source and documentation are licensed under
+[MIT No Attribution (MIT-0)](LICENSE), using the
+[SPDX MIT-0 license text](https://spdx.org/licenses/MIT-0.html).
+Linked dependencies, including Verkko/Canu and their bundled libraries, retain
+their own licenses; this license does not relicense them or replace their
+distribution requirements.
+
+Repository engineering expectations are in [AGENTS.md](AGENTS.md). C++ formatting
+is defined by `.clang-format`; use `clang-format -i src/*.cpp src/*.hpp tests/core.cpp`
+after code edits, then rebuild and run CTest as described below. Comments should
+explain invariants, ownership, coordinate conventions, and non-obvious decisions,
+not simply narrate statements.
+
 Standalone C++ prototype for expanding a fixed homopolymer-compressed (HPC)
 template using reads and placements from Verkko `.cnspack` files. It reuses the
 native Canu/Verkko package reader; it does not use POA or remap reads genome-wide.
@@ -40,11 +55,16 @@ Building still requires Verkko headers and its static library.
   does not embed these sequences, so this companion file is normally required.
   Embedded tig bases are accepted as an HPC template if present. If both sources
   are supplied, they must agree.
-- Input template names are `piece000001`-style names or numeric packaged tig IDs.
-  All output references use `piece` plus the tig ID padded to at least six digits,
-  consistently in FASTA, CRAM, VCF, and diagnostics. No tig-name map is needed;
-  `--tig-map` has been removed. Arbitrary graph segment names are not automatically
-  associated with numeric tigs; scfmap-based input association is not implemented.
+- `--tig-map packages.tigName_to_ID.map` associates template FASTA names with
+  packaged IDs using whitespace-separated `internal_ID FASTA_name` rows. For
+  example, `109 piece000111` selects `>piece000111` for internal tig 109.
+  Blank lines and full-line `#` comments are allowed; duplicate IDs/names and
+  malformed rows are rejected. A supplied map is authoritative (no suffix fallback).
+  Without a map, numeric IDs, `tig00000109`, and legacy `piece000109` names are
+  recognized directly. Automatic scfmap/GFA-path association is not implemented.
+  All output references use `tig` plus the internal ID zero-padded to eight digits
+  (`tig00000109`), consistently in FASTA, CRAM, VCF, and diagnostics. Larger IDs
+  retain all digits rather than being truncated.
 - Templates must be A/C/G/T/N, homopolymer compressed, and correspond to the
   packaged tig. Their offset is inferred from reads as described below.
 - `--tier` specifies name globs, highest priority first. Patterns match the
@@ -225,7 +245,8 @@ the prototype test covers only the main tig). This is not production validation.
 - No genome-scale runtime, memory, or consensus-QV claims yet. No automatic
   package discovery, pipeline integration, or multi-package CRAM merge.
 
-The broader [design proposal](../CONSENSUS_V2_DESIGN.md) includes future work;
+The repository-local [design proposal](CONSENSUS_V2_DESIGN.md) includes current
+implementation status, historical rationale, and future work;
 this README describes the implemented prototype.
 
 ## Memory behavior

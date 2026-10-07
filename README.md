@@ -20,7 +20,7 @@ From this directory:
 
 ```sh
 cmake -S . -B build \
-  -DVERKKO_ROOT=/Users/korens/Documents/Software/verkko \
+  -DVERKKO_ROOT=full/path/to/verkko \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 4
 ctest --test-dir build --output-on-failure

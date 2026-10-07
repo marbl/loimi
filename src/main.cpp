@@ -181,6 +181,21 @@ static std::map<uint32_t, std::string> template_names(const std::string &path) {
     if (!(fields >> id) || id[0] == '#')
       continue;
     const auto context = " in tig map at line " + std::to_string(line_number);
+    // Verkko emits a human-readable table heading. Recognize its exact tokens
+    // only before data, so malformed mapping rows are still reported as errors.
+    if (names.empty() && id == "tigID") {
+      std::string trailing;
+      require(bool(fields >> name >> extra) && name == "tig" && extra == "name" &&
+                  !(fields >> trailing),
+              "Invalid tig map heading" + context);
+      continue;
+    }
+    if (names.empty() && id.find_first_not_of('-') == std::string::npos) {
+      require(bool(fields >> name) && name.find_first_not_of('-') == std::string::npos &&
+                  !(fields >> extra),
+              "Invalid tig map separator" + context);
+      continue;
+    }
     require(bool(fields >> name) && !(fields >> extra), "Expected ID NAME" + context);
     require(id.find_first_not_of("0123456789") == std::string::npos,
             "Invalid internal tig ID" + context);

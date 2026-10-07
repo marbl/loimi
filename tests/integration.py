@@ -56,10 +56,16 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
     mapped = base + ["--template-hpc", root / "mapped.fa", "--tig-map", root / "tig.map"]
     run(mapped + ["--output", root / "mapped"])
     assert (root / "mapped.fasta").read_bytes() == (root / "fast.fasta").read_bytes()
+    # Accept the native Verkko table heading as well as headerless maps.
+    (root / "tig.map").write_text("     tigID  tig name\n----------  --------------------\n         1  piece000111\n         2  piece000002\n         3  piece000003\n")
+    run(mapped + ["--output", root / "mapped-header"])
+    assert (root / "mapped-header.fasta").read_bytes() == (root / "fast.fasta").read_bytes()
     for label, contents in [("duplicate-id", "1 piece000111\n1 other\n"),
                             ("duplicate-name", "1 piece000111\n2 piece000111\n"),
                             ("invalid-id", "-1 piece000111\n"),
                             ("extra-column", "1 piece000111 extra\n"),
+                            ("bad-header", "tigID wrong name\n1 piece000111\n"),
+                            ("bad-row-after-header", "tigID tig name\n---------- --------------------\nnot-an-id piece000111\n"),
                             ("missing-entry", "2 piece000111\n")]:
         (root / "bad.map").write_text(contents)
         run(mapped + ["--tig-map", root / "bad.map", "--output", root / label], ok=False)

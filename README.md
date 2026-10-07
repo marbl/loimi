@@ -58,7 +58,8 @@ Building still requires Verkko headers and its static library.
 - `--tig-map packages.tigName_to_ID.map` associates template FASTA names with
   packaged IDs using whitespace-separated `internal_ID FASTA_name` rows. For
   example, `109 piece000111` selects `>piece000111` for internal tig 109.
-  Blank lines and full-line `#` comments are allowed; duplicate IDs/names and
+  Verkko's `tigID  tig name` heading and dashed separator are accepted, as are
+  headerless maps, blank lines, and full-line `#` comments; duplicate IDs/names and
   malformed rows are rejected. A supplied map is authoritative (no suffix fallback).
   Without a map, numeric IDs, `tig00000109`, and legacy `piece000109` names are
   recognized directly. Automatic scfmap/GFA-path association is not implemented.

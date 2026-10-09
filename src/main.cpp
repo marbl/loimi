@@ -11,6 +11,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iomanip>
 #include <memory>
@@ -28,12 +29,18 @@ struct Options {
   // These defaults are part of the CLI contract; update help, README, and tests
   // together whenever changing an algorithmic threshold or resource policy.
   std::string input, templates, tig_map, output, cram;
+  std::string evidence_sites, evidence_exclude_reads;
+  std::map<std::string, std::string> model_paths;
   std::vector<Tier> tiers;
   unsigned threads = 1, min_support = 1, polish_support = 5;
   size_t batch_bases = 8000000;
   double max_error = 0.15, polish_fraction = 0.9;
   size_t max_indel = 500;
   bool polish = false, drop_unmatched = false, missing_error = false;
+  bool experiment_mean = false, ambiguous_fallback = true;
+  bool region = false;
+  uint32_t region_tig = 0;
+  size_t region_begin = 0, region_end = 0, region_flank = 100000;
 };
 static void require(bool b, const std::string &s) {
   if (!b)
@@ -44,6 +51,27 @@ static unsigned number(const std::string &s) {
   auto n = std::stoul(s, &used);
   require(used == s.size() && n > 0 && n <= UINT32_MAX, "Expected positive integer: " + s);
   return n;
+}
+static size_t coordinate(const std::string &s) {
+  require(!s.empty() && s.find_first_not_of("0123456789") == std::string::npos,
+          "Expected nonnegative coordinate: " + s);
+  auto n = std::stoull(s);
+  require(n <= SIZE_MAX && n <= INT64_MAX, "Coordinate out of range: " + s);
+  return size_t(n);
+}
+static void parse_region(Options &o, const std::string &s) {
+  require(!o.region, "Specify --region only once");
+  auto colon = s.find(':');
+  auto dash = s.find('-', colon == std::string::npos ? 0 : colon + 1);
+  require(s.rfind("tig", 0) == 0 && colon != std::string::npos && dash != std::string::npos,
+          "Expected --region tig00000109:0-10000000 (draft bases, zero-based half-open)");
+  auto id = coordinate(s.substr(3, colon - 3));
+  require(id <= UINT32_MAX, "Region tig ID out of range");
+  o.region_tig = uint32_t(id);
+  o.region_begin = coordinate(s.substr(colon + 1, dash - colon - 1));
+  o.region_end = coordinate(s.substr(dash + 1));
+  require(o.region_begin < o.region_end, "Region must have begin < end");
+  o.region = true;
 }
 static double probability(const std::string &s) {
   size_t used = 0;
@@ -71,7 +99,15 @@ static Options parse(int argc, char **argv) {
              "Template offsets are inferred per tig; singleton reads pass through directly.\n"
              "--tig-map FILE        Template association: internal_ID FASTA_name per line\n"
              "Output names are tig + eight-digit packaged tig ID (e.g. tig00000109).\n"
+             "--region TIG:BEGIN-END  One tig, zero-based half-open uncompressed draft bases\n"
+             "--region-flank N      Context in bases/runs (default 100000; region mode only)\n"
+             "--experiment-run-mean  Diagnostic rounded-mean run caller (default: mode)\n"
+             "--evidence-sites FILE  Export all-tier HPC histograms at TIG RUN rows (zero-based)\n"
+             "--evidence-exclude-reads FILE  Read IDs excluded only from diagnostic histograms\n"
+             "--unique-only        Disable default fallback to multiply placed reads\n"
+             "--ambiguous-fallback Use non-unique tiers after all unique tiers (default)\n"
              "--tier [LABEL=]GLOB   Repeated in priority order; first matching glob wins\n"
+             "--tier-model LABEL=FILE  Optional calibrated run-length model for one tier\n"
              "--unmatched error|drop (default error)\n--min-run-support N (default 1)\n"
              "--missing-run one|error (default one)\n--max-error F (default 0.15)\n"
              "--threads N (default 1; parallel alignments within each tig)\n"
@@ -88,12 +124,33 @@ static Options parse(int argc, char **argv) {
       o.templates = value();
     else if (a == "--tig-map")
       o.tig_map = value();
+    else if (a == "--region")
+      parse_region(o, value());
+    else if (a == "--region-flank")
+      o.region_flank = coordinate(value());
     else if (a == "--output")
       o.output = value();
     else if (a == "--cram")
       o.cram = value();
     else if (a == "--polish-non-hpc")
       o.polish = true;
+    else if (a == "--experiment-run-mean")
+      o.experiment_mean = true;
+    else if (a == "--evidence-sites")
+      o.evidence_sites = value();
+    else if (a == "--evidence-exclude-reads")
+      o.evidence_exclude_reads = value();
+    else if (a == "--tier-model") {
+      auto v = value();
+      auto equal = v.find('=');
+      require(equal != std::string::npos && equal > 0 && equal + 1 < v.size(),
+              "Expected --tier-model LABEL=FILE");
+      require(o.model_paths.emplace(v.substr(0, equal), v.substr(equal + 1)).second,
+              "Duplicate tier model");
+    } else if (a == "--ambiguous-fallback" || a == "--experiment-ambiguous-fallback")
+      o.ambiguous_fallback = true;
+    else if (a == "--unique-only")
+      o.ambiguous_fallback = false;
     else if (a == "--threads")
       o.threads = number(value());
     else if (a == "--batch-bases")
@@ -135,6 +192,19 @@ static Options parse(int argc, char **argv) {
   require(!o.input.empty() && !o.output.empty() && !o.tiers.empty(),
           "Require --import, --output and at least one --tier; see --help");
   require(o.polish_fraction > 0.5, "Polishing fraction must exceed 0.5");
+  require(o.model_paths.empty() || !o.experiment_mean,
+          "--tier-model cannot be combined with --experiment-run-mean");
+  for (const auto &[label, path] : o.model_paths)
+    require(std::any_of(o.tiers.begin(), o.tiers.end(),
+                        [&](const auto &tier) { return tier.label == label; }),
+            "Model refers to unknown tier: " + label);
+  require(o.evidence_exclude_reads.empty() || !o.evidence_sites.empty(),
+          "--evidence-exclude-reads requires --evidence-sites");
+  require(
+      o.evidence_sites.empty() || !o.region,
+      "Evidence export uses complete template coordinates; extract a fixture instead of --region");
+  require(!o.region || o.region_end <= size_t(INT64_MAX) - o.region_flank,
+          "Region plus flank overflows coordinate range");
   return o;
 }
 static std::map<std::string, std::string> fasta(const std::string &path) {
@@ -234,7 +304,9 @@ struct ReadOwner {
   std::map<uint32, Read> reads;
 };
 // Use native binary readers but retain only decoded sequences, not packed blobs too.
-static bool load_package(readBuffer &input, tgTig &tig, ReadOwner *owner) {
+using ReadFilter = std::function<bool(tgTig &, sqRead &, ReadOwner &)>;
+static bool load_package(readBuffer &input, tgTig &tig, ReadOwner *owner,
+                         const ReadFilter &retain = {}) {
   // Native packages contain children+1 read records, including a redundant first
   // record. Consume every record, but retain each ID only once. A null owner is
   // the metadata prepass; the reusable sqRead then holds just one decoded record.
@@ -243,7 +315,8 @@ static bool load_package(readBuffer &input, tgTig &tig, ReadOwner *owner) {
   sqRead read;
   for (uint32_t i = 0; i <= tig.numberOfChildren(); ++i) {
     sqStore::sqStore_loadReadFromBuffer(&input, &read);
-    if (owner && !owner->reads.count(read.sqRead_readID()))
+    if (owner && !owner->reads.count(read.sqRead_readID()) &&
+        (!retain || retain(tig, read, *owner)))
       owner->reads.emplace(read.sqRead_readID(),
                            ReadOwner::Read{read.sqRead_name(),
                                            std::make_shared<const std::string>(
@@ -289,6 +362,94 @@ static unsigned placement_mapq(unsigned n) {
     return 60;
   return unsigned(std::lround(-10 * std::log10(1.0 - 1.0 / n)));
 }
+// Shared lookup for region planning and the full caller; the name map remains
+// authoritative even when the chosen region is only a prefix of a template.
+static std::string template_for(tgTig &tig, const Options &o,
+                                const std::map<std::string, std::string> &templates,
+                                const std::map<uint32_t, std::string> &names) {
+  std::string ref(tig.bases() ? tig.bases() : "", tig._basesLen);
+  auto it = templates.end();
+  if (!o.tig_map.empty()) {
+    auto n = names.find(tig.tigID());
+    if (n != names.end())
+      it = templates.find(n->second);
+  } else {
+    for (const auto &prefix : {std::string("tig"), std::string(""), std::string("piece")}) {
+      std::ostringstream key;
+      key << prefix << std::setfill('0')
+          << std::setw(prefix == "tig"     ? 8
+                       : prefix == "piece" ? 6
+                                           : 0)
+          << tig.tigID();
+      it = templates.find(key.str());
+      if (it != templates.end())
+        break;
+    }
+  }
+  if (it != templates.end()) {
+    require(ref.empty() || ref == it->second, "Embedded/external template mismatch");
+    ref = it->second;
+  }
+  return ref;
+}
+struct Offset {
+  int64_t value = 0;
+  size_t attempted = 0, placed = 0, validated = 0;
+  bool sparse = false;
+};
+static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const std::string &ref,
+                           double max_error, size_t eligible_count = SIZE_MAX) {
+  std::vector<size_t> seeds;
+  for (size_t i = 0; i < work.size(); ++i)
+    if (work[i].reason.empty() && work[i].unique)
+      seeds.push_back(i);
+  size_t margin = layout_length > ref.size() ? layout_length - ref.size() : 0;
+  auto rank = [&](size_t i) {
+    auto &w = work[i];
+    return std::make_tuple(w.a.tier, w.hbegin < margin || w.hend > ref.size(), w.hbegin, w.a.id);
+  };
+  std::sort(seeds.begin(), seeds.end(), [&](size_t a, size_t b) { return rank(a) < rank(b); });
+  Offset out;
+  out.sparse = (eligible_count == SIZE_MAX ? seeds.size() : eligible_count) < 6;
+  std::vector<int64_t> estimates;
+  for (size_t i : seeds) {
+    if (out.attempted == 32)
+      break;
+    ++out.attempted;
+    auto &w = work[i];
+    auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                       w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                 .bases;
+    auto pos = locate(q, ref, max_error);
+    if (pos < 0)
+      continue;
+    estimates.push_back(int64_t(w.hbegin) - pos);
+    out.placed = estimates.size();
+    if (out.sparse || estimates.size() < 6)
+      continue;
+    size_t split = estimates.size() / 2;
+    try {
+      auto first = offset_cluster({estimates.begin(), estimates.begin() + split});
+      auto second = offset_cluster({estimates.begin() + split, estimates.end()});
+      if (std::abs(first - second) > 20)
+        continue;
+      out.value = offset_cluster(estimates);
+      out.validated = 0;
+      for (size_t j = split; j < estimates.size(); ++j)
+        out.validated += std::abs(estimates[j] - out.value) <= 20;
+      if (out.validated >= 3)
+        return out;
+    } catch (const std::runtime_error &) {
+    }
+  }
+  if (out.sparse && !estimates.empty()) {
+    out.value = offset_cluster(estimates, 1);
+    return out;
+  }
+  throw std::runtime_error("Cannot infer reliable template offset from " +
+                           std::to_string(out.attempted) + " reads (" +
+                           std::to_string(estimates.size()) + " unique placements)");
+}
 template <class F> static void parallel(size_t n, unsigned nt, F action) {
   // Each worker owns one Work slot; histogram accumulation is serial afterward.
   // Actions must catch per-read failures themselves: exceptions cannot cross threads.
@@ -313,8 +474,49 @@ int main(int argc, char **argv) {
     Options o = parse(argc, argv);
     auto templates = fasta(o.templates);
     auto mapped_names = template_names(o.tig_map);
+    std::map<int, RunModel> models;
+    for (size_t i = 0; i < o.tiers.size(); ++i) {
+      auto path = o.model_paths.find(o.tiers[i].label);
+      if (path != o.model_paths.end()) {
+        std::ifstream input(path->second);
+        require(bool(input), "Cannot open tier model: " + path->second);
+        models.emplace(i, RunModel::read(input));
+      }
+    }
+    // Calibration observes the exact accepted HPC votes, before priority drops
+    // lower tiers. Exclusions affect this diagnostic only, never consensus.
+    std::map<std::string, std::set<size_t>> evidence_sites;
+    std::set<uint32_t> evidence_excluded;
+    if (!o.evidence_sites.empty()) {
+      std::ifstream in(o.evidence_sites);
+      require(bool(in), "Cannot open evidence sites");
+      std::string line;
+      while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#')
+          continue;
+        std::istringstream row(line);
+        std::string name, pos, extra;
+        require(bool(row >> name >> pos) && !(row >> extra), "Expected TIG RUN in evidence sites");
+        require(evidence_sites[name].insert(coordinate(pos)).second, "Duplicate evidence site");
+      }
+      require(in.eof(), "Cannot read evidence sites");
+    }
+    if (!o.evidence_exclude_reads.empty()) {
+      std::ifstream in(o.evidence_exclude_reads);
+      require(bool(in), "Cannot open evidence read exclusions");
+      std::string id;
+      while (in >> id)
+        evidence_excluded.insert(number(id));
+      require(in.eof(), "Cannot read evidence exclusions");
+    }
     std::vector<std::string> suffixes = {".fasta", ".run-calls.tsv", ".read-decisions.tsv",
                                          ".summary.json", ".template-offsets.tsv"};
+    if (o.region)
+      suffixes.push_back(".region.tsv");
+    if (!o.evidence_sites.empty())
+      suffixes.push_back(".run-evidence.tsv");
+    if (!models.empty())
+      suffixes.push_back(".models.tsv");
     if (o.polish) {
       suffixes.push_back(".non-hpc-edits.vcf");
       suffixes.push_back(".draft.fasta");
@@ -341,7 +543,14 @@ int main(int argc, char **argv) {
     auto &fa = outputs[".fasta"];
     auto &calls = outputs[".run-calls.tsv"];
     auto &decisions = outputs[".read-decisions.tsv"];
-    calls << "tig\trun\tdraft_begin\tdraft_end\tbase\tlength\ttier\tdepth\tpeak\n";
+    if (!models.empty()) {
+      outputs[".models.tsv"] << "tier\tmodel_path\n";
+      for (const auto &[label, path] : o.model_paths)
+        outputs[".models.tsv"] << label << '\t' << path << '\n';
+    }
+    calls << "tig\trun\tdraft_begin\tdraft_end\tbase\tlength\ttier\tdepth\tpeak\tplacement_class\n";
+    if (!o.evidence_sites.empty())
+      outputs[".run-evidence.tsv"] << "tig\trun\tbase\ttier\tplacement_class\tlength\tcount\n";
     decisions << "tig\tread_id\tname\ttier\tstatus\n";
     outputs[".template-offsets.tsv"]
         << "tig\toffset\tattempted\tplaced\tvalidation_support\ttolerance\tmethod\n";
@@ -359,7 +568,8 @@ int main(int argc, char **argv) {
       body.exceptions(std::ios::badbit | std::ios::failbit);
     }
     uint64_t tigs = 0, read_count = 0, used = 0, dropped = 0, no_evidence = 0, n_edits = 0,
-             n_cram = 0, exact = 0, base_alignments = 0;
+             n_cram = 0, exact = 0, base_alignments = 0, ambiguous_run_calls = 0,
+             model_changed_runs = 0;
     std::set<uint32_t> tig_ids, emitted_ids;
     std::map<uint32_t, unsigned> occurrences, declared;
     sqRead_setDefaultVersion(sqRead_raw | sqRead_normal);
@@ -382,13 +592,129 @@ int main(int argc, char **argv) {
       }
     }
     memory_stage("placement prepass complete");
+    Offset region_offset;
+    size_t region_hpc_end = 0;
+    std::set<uint32_t> region_reads;
+    if (o.region) {
+      // Region mode needs one additional sequential pass: keep only the first
+      // 32 ranked offset anchors, infer against the complete HPC template, then
+      // retain just prefix-overlapping reads in the normal processing pass.
+      // Multiplicity was counted across the COMPLETE package above.
+      readBuffer scan(o.input.c_str());
+      bool found = false;
+      while (!scan.eof()) {
+        tgTig t;
+        ReadOwner anchors;
+        std::map<uint32_t, tgPosition *> positions;
+        using Rank = std::tuple<int, bool, size_t, uint32_t>;
+        std::set<Rank> ranks;
+        std::set<uint32_t> considered;
+        size_t eligible = 0;
+        std::string template_seq;
+        bool prepared = false;
+        auto retain = [&](tgTig &tig, sqRead &read, ReadOwner &owner) {
+          if (tig.tigID() != o.region_tig)
+            return false;
+          if (!prepared) {
+            prepared = true;
+            template_seq = template_for(tig, o, templates, mapped_names);
+            for (uint32_t i = 0; i < tig.numberOfChildren(); ++i) {
+              auto p = tig.getChild(i);
+              if (p->_numPlacement == 1 && occurrences[p->ident()] == 1 &&
+                  declared[p->ident()] == 1)
+                positions.emplace(p->ident(), p);
+            }
+          }
+          uint32_t id = read.sqRead_readID();
+          auto it = positions.find(id);
+          if (it == positions.end() || !considered.insert(id).second)
+            return false;
+          int tier = tier_of(read.sqRead_name(), o.tiers);
+          if (tier < 0)
+            return false;
+          ++eligible;
+          auto p = it->second;
+          require(p->min() >= 0 && p->max() > p->min() && size_t(p->max()) <= tig.length(),
+                  "Invalid layout interval in region anchor");
+          size_t margin =
+              tig.length() > template_seq.size() ? tig.length() - template_seq.size() : 0;
+          Rank rank{tier, size_t(p->min()) < margin || size_t(p->max()) > template_seq.size(),
+                    size_t(p->min()), id};
+          ranks.insert(rank);
+          if (ranks.size() > 32) {
+            auto worst = std::prev(ranks.end());
+            uint32_t removed = std::get<3>(*worst);
+            ranks.erase(worst);
+            owner.reads.erase(removed);
+            if (removed == id)
+              return false;
+          }
+          return true;
+        };
+        if (!load_package(scan, t, &anchors, retain))
+          break;
+        if (t.tigID() != o.region_tig)
+          continue;
+        require(!found, "Repeated region tig ID");
+        found = true;
+        // The existing singleton path crops the oriented read directly.
+        if (t.numberOfChildren() == 1) {
+          region_reads.insert(t.getChild(0)->ident());
+          continue;
+        }
+        require(!template_seq.empty(), "Region tig has no HPC template");
+        std::vector<Work> seeds;
+        for (auto &[id, rd] : anchors.reads) {
+          auto p = positions.at(id);
+          Work w;
+          w.unique = true;
+          w.a.id = id;
+          w.a.tier = tier_of(rd.name, o.tiers);
+          w.a.sequence = p->isReverse() ? reverse_complement(*rd.sequence) : *rd.sequence;
+          require(p->_askip >= 0 && p->_bskip >= 0 &&
+                      size_t(p->_askip) + size_t(p->_bskip) < w.a.sequence.size(),
+                  "Invalid raw clipping in region anchor");
+          w.a.clip_left = p->_askip;
+          w.a.clip_right = p->_bskip;
+          w.hbegin = p->min();
+          w.hend = p->max();
+          seeds.push_back(std::move(w));
+        }
+        region_offset = infer_offset(seeds, t.length(), template_seq, o.max_error, eligible);
+        // At least one raw base per run guarantees this prefix reaches END.
+        // Keep full overlapping placements as context so artificial boundaries
+        // do not change their run correspondence. Do not recursively extend.
+        size_t limit = std::min(template_seq.size(), o.region_end + o.region_flank);
+        region_hpc_end = limit;
+        for (uint32_t i = 0; i < t.numberOfChildren(); ++i) {
+          auto p = t.getChild(i);
+          int64_t b = int64_t(p->min()) - region_offset.value;
+          int64_t e = int64_t(p->max()) - region_offset.value;
+          if (b < int64_t(limit) && e > 0) {
+            region_reads.insert(p->ident());
+            region_hpc_end =
+                std::max(region_hpc_end, size_t(std::min<int64_t>(e, template_seq.size())));
+          }
+        }
+        std::cerr << "Region: retaining " << region_reads.size() << " read IDs for "
+                  << region_hpc_end << " HPC prefix runs\n";
+      }
+      require(found, "Requested region tig is absent from package");
+      outputs[".region.tsv"]
+          << "tig\tdraft_begin\tdraft_end\tfinal_begin\tfinal_end\tprocessed_hpc_end\n";
+    }
     readBuffer input(o.input.c_str());
     while (!input.eof()) {
       tgTig tig;
       ReadOwner owner;
       memory_stage("loading next tig");
-      if (!load_package(input, tig, &owner))
+      auto retain_region = [&](tgTig &t, sqRead &r, ReadOwner &) {
+        return !o.region || (t.tigID() == o.region_tig && region_reads.count(r.sqRead_readID()));
+      };
+      if (!load_package(input, tig, &owner, retain_region))
         break;
+      if (o.region && tig.tigID() != o.region_tig)
+        continue;
       memory_stage("package loaded");
       ++tigs;
       require(tig_ids.insert(tig.tigID()).second, "Repeated tig ID");
@@ -396,32 +722,21 @@ int main(int argc, char **argv) {
       label << "tig" << std::setfill('0') << std::setw(8) << tig.tigID();
       std::string name = label.str();
       require(name.find_first_of("\t\r\n ") == std::string::npos, "Invalid contig name");
-      std::string ref(tig.bases() ? tig.bases() : "", tig._basesLen);
-      auto it = templates.end();
-      if (!o.tig_map.empty()) {
-        auto mapped = mapped_names.find(tig.tigID());
-        if (mapped != mapped_names.end())
-          it = templates.find(mapped->second);
-      } else {
-        it = templates.find(name);
-        if (it == templates.end())
-          it = templates.find(std::to_string(tig.tigID()));
-        if (it == templates.end()) {
-          std::ostringstream legacy;
-          legacy << "piece" << std::setfill('0') << std::setw(6) << tig.tigID();
-          it = templates.find(legacy.str());
-        }
-      }
-      if (it != templates.end()) {
-        require(ref.empty() || ref == it->second, "Embedded/external template mismatch");
-        ref = it->second;
-      }
+      std::string ref = template_for(tig, o, templates, mapped_names);
+      if (o.region && tig.numberOfChildren() != 1)
+        ref.resize(region_hpc_end);
       std::vector<Work> work;
       std::set<decltype(placement_key(tig.getChild(0)))> local;
       for (uint32_t i = 0; i < tig.numberOfChildren(); ++i) {
         auto *p = tig.getChild(i);
         if (!local.insert(placement_key(p)).second)
           continue;
+        if (o.region && tig.numberOfChildren() != 1) {
+          int64_t b = int64_t(p->min()) - region_offset.value;
+          int64_t e = int64_t(p->max()) - region_offset.value;
+          if (b >= int64_t(std::min(ref.size(), o.region_end + o.region_flank)) || e <= 0)
+            continue;
+        }
         auto r = owner.reads.find(p->ident());
         require(r != owner.reads.end(), "Missing packaged read");
         auto &rd = r->second;
@@ -436,9 +751,9 @@ int main(int argc, char **argv) {
         if (declared[w.a.id] == 0 && occurrences[w.a.id] == 1)
           w.placements = 0;
         w.unique = p->_numPlacement == 1 && w.placements == 1;
-        // Ambiguous reads may be exported, but never seed the offset or vote in
-        // this caller. Counts include alternatives even if later alignment fails.
-        if (!w.unique && o.cram.empty())
+        // Known non-unique reads can supply fallback evidence. Unknown placement
+        // counts remain export-only. Offset anchors still require unique reads.
+        if (!w.unique && o.cram.empty() && !(o.ambiguous_fallback && w.placements > 1))
           w.reason = "AMBIGUOUS_PLACEMENT";
         // Legacy skipConsensus encodes template-building priority, not exclusion.
         // Explicit tiers replace that policy; placement count determines uniqueness.
@@ -463,15 +778,26 @@ int main(int argc, char **argv) {
         work.push_back(std::move(w));
       }
       owner.reads.clear();
-      if (work.size() == 1) {
+      if (work.size() == 1 && (!o.region || tig.numberOfChildren() == 1)) {
         // Passthrough has no graph-coordinate inference or polishing. Preserve
         // oriented full read storage for SAM, emitting only its unclipped interval.
         auto &w = work.front();
-        require(w.reason.empty() && w.unique,
-                "Singleton tig " + name + " has no eligible unique read: " + w.reason);
+        require(w.reason.empty() && (w.unique || (o.ambiguous_fallback && w.placements > 1)),
+                "Singleton tig " + name + " has no eligible read: " + w.reason);
         auto seq =
             w.a.bases().substr(w.a.clip_left, w.a.bases().size() - w.a.clip_left - w.a.clip_right);
+        if (o.region) {
+          require(o.region_begin < seq.size(), "Region starts beyond singleton length");
+          size_t end = std::min(o.region_end, seq.size());
+          outputs[".region.tsv"] << name << '\t' << o.region_begin << '\t' << end << '\t'
+                                 << o.region_begin << '\t' << end << "\t.\n";
+          w.a.clip_left += o.region_begin;
+          w.a.clip_right += seq.size() - end;
+          seq = seq.substr(o.region_begin, end - o.region_begin);
+        }
         auto rle = encode(seq);
+        if (!w.unique)
+          ambiguous_run_calls += rle.bases.size();
         ++used;
         write_fasta(fa, name, seq);
         refs.emplace_back(name, seq.size());
@@ -480,7 +806,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < rle.bases.size(); ++i)
           calls << name << '\t' << i << '\t' << rle.offsets[i] << '\t' << rle.offsets[i + 1] << '\t'
                 << rle.bases[i] << '\t' << rle.lengths[i] << '\t' << o.tiers[w.a.tier].label
-                << "\t1\t1\n";
+                << "\t1\t1\t" << (w.unique ? "UNIQUE" : "AMBIGUOUS") << '\n';
         outputs[".template-offsets.tsv"] << name << "\t.\t0\t0\t0\t0\tSINGLE_READ\n";
         decisions << name << '\t' << w.a.id << '\t' << w.a.name << '\t' << o.tiers[w.a.tier].label
                   << "\tACCEPTED\n";
@@ -508,71 +834,13 @@ int main(int argc, char **argv) {
         require(std::string("ACGTN").find(ref[i]) != std::string::npos &&
                     (!i || ref[i] != ref[i - 1]),
                 "Template is not homopolymer compressed: " + name);
-      // Prefer high-tier reads away from possible overhangs, then try boundary reads.
-      std::vector<size_t> seeds;
-      for (size_t i = 0; i < work.size(); ++i)
-        if (work[i].reason.empty() && work[i].unique)
-          seeds.push_back(i);
-      size_t margin = tig.length() > ref.size() ? tig.length() - ref.size() : 0;
-      auto rank = [&](size_t i) {
-        auto &w = work[i];
-        return std::make_tuple(w.a.tier, w.hbegin < margin || w.hend > ref.size(), w.hbegin,
-                               w.a.id);
-      };
-      std::sort(seeds.begin(), seeds.end(), [&](size_t a, size_t b) { return rank(a) < rank(b); });
-      std::vector<int64_t> estimates;
-      int64_t offset = 0;
-      size_t attempted = 0, validated = 0;
-      bool inferred = false;
-      // Disjoint discovery/validation sets. Never choose an offset from lengths alone.
-      for (size_t i : seeds) {
-        if (attempted == 32)
-          break;
-        ++attempted;
-        auto &w = work[i];
-        auto q = encode(w.a.bases().substr(w.a.clip_left,
-                                           w.a.bases().size() - w.a.clip_left - w.a.clip_right))
-                     .bases;
-        auto pos = locate(q, ref, o.max_error);
-        if (pos < 0)
-          continue;
-        estimates.push_back(int64_t(w.hbegin) - pos);
-        if (seeds.size() < 6 || estimates.size() < 6)
-          continue;
-        size_t split = estimates.size() / 2;
-        try {
-          auto first = offset_cluster({estimates.begin(), estimates.begin() + split});
-          auto second = offset_cluster({estimates.begin() + split, estimates.end()});
-          if (std::abs(first - second) > 20)
-            continue;
-          offset = offset_cluster(estimates);
-          validated = 0;
-          for (size_t j = split; j < estimates.size(); ++j)
-            if (std::abs(estimates[j] - offset) <= 20)
-              ++validated;
-          if (validated >= 3) {
-            inferred = true;
-            break;
-          }
-        } catch (const std::runtime_error &) {
-        }
-      }
-      if (seeds.size() < 6 && !estimates.empty()) {
-        // Align every available read. Sparse evidence has no held-out validation.
-        try {
-          offset = offset_cluster(estimates, 1);
-          inferred = true;
-        } catch (const std::runtime_error &) {
-        }
-      }
-      require(inferred, "Cannot infer reliable template offset for tig " + name + " from " +
-                            std::to_string(attempted) + " reads (" +
-                            std::to_string(estimates.size()) + " unique placements)");
-      outputs[".template-offsets.tsv"] << name << '\t' << offset << '\t' << attempted << '\t'
-                                       << estimates.size() << '\t' << validated << "\t20\t"
-                                       << (seeds.size() < 6 ? "SPARSE" : "VALIDATED") << '\n';
+      auto inferred = o.region ? region_offset : infer_offset(work, tig.length(), ref, o.max_error);
+      int64_t offset = inferred.value;
+      outputs[".template-offsets.tsv"]
+          << name << '\t' << offset << '\t' << inferred.attempted << '\t' << inferred.placed << '\t'
+          << inferred.validated << "\t20\t" << (inferred.sparse ? "SPARSE" : "VALIDATED") << '\n';
       std::cerr << "tig " << name << ": inferred template offset " << offset << " from "
-                << estimates.size() << " reads\n";
+                << inferred.placed << " reads\n";
       for (auto &w : work)
         if (w.reason.empty()) {
           // Recover overlap in template space; coordinate clipping here does not
@@ -595,10 +863,23 @@ int main(int argc, char **argv) {
       // One inline allele handles the common case. Alternative lengths use
       // sparse overflow. Higher support thresholds must retain every tier until
       // its total depth is known, otherwise fallback would depend on read order.
-      size_t histogram_tiers = o.min_support == 1 ? 1 : o.tiers.size();
+      // Fallback is a SECOND ordered group, after every unique
+      // tier. It never allows an ambiguous high tier to displace unique evidence.
+      size_t histogram_tiers =
+          o.min_support == 1 ? 1 : o.tiers.size() * (o.ambiguous_fallback ? 2 : 1);
       require(ref.size() <= SIZE_MAX / histogram_tiers, "Histogram allocation overflow");
       std::vector<RunBin> bins(ref.size() * histogram_tiers);
       std::map<size_t, Histogram> overflow;
+      std::vector<uint8_t> evidence_mask;
+      std::map<std::pair<size_t, int>, Histogram> evidence;
+      auto selected_sites = evidence_sites.find(name);
+      if (selected_sites != evidence_sites.end()) {
+        evidence_mask.resize(ref.size());
+        for (size_t pos : selected_sites->second) {
+          require(pos < ref.size(), "Evidence site outside template: " + name);
+          evidence_mask[pos] = 1;
+        }
+      }
       memory_stage("starting batched HPC alignment");
       for (size_t batch = 0; batch < work.size();) {
         // This bounds scratch, not total RSS. Always admit one read even if it
@@ -637,7 +918,7 @@ int main(int argc, char **argv) {
         });
         for (size_t i = batch; i < end; ++i) {
           auto &w = work[i];
-          if (w.reason.empty() && w.unique) {
+          if (w.reason.empty() && (w.unique || (o.ambiguous_fallback && w.placements > 1))) {
             ++used;
             if (w.rle.bases == ref.substr(w.hbegin, w.hend - w.hbegin))
               ++exact;
@@ -652,12 +933,16 @@ int main(int argc, char **argv) {
               if (op == '=' && ref[r] != 'N' && !partial) {
                 auto len = w.rle.lengths[q];
                 {
-                  size_t key = r * histogram_tiers + (o.min_support == 1 ? 0 : w.a.tier);
+                  int vote_tier = w.a.tier + (w.unique ? 0 : int(o.tiers.size()));
+                  if (!evidence_mask.empty() && evidence_mask[r] &&
+                      !evidence_excluded.count(w.a.id))
+                    ++evidence[{r, vote_tier}][len];
+                  size_t key = r * histogram_tiers + (o.min_support == 1 ? 0 : vote_tier);
                   auto &bin = bins[key];
-                  if (bin.tier < 0 || w.a.tier < bin.tier) {
-                    bin = {len, 1, w.a.tier};
+                  if (bin.tier < 0 || vote_tier < bin.tier) {
+                    bin = {len, 1, vote_tier};
                     overflow.erase(key);
-                  } else if (w.a.tier == bin.tier) {
+                  } else if (vote_tier == bin.tier) {
                     if (len == bin.length)
                       ++bin.count;
                     else
@@ -685,6 +970,16 @@ int main(int argc, char **argv) {
         batch = end;
       }
       memory_stage("HPC evidence complete");
+      for (const auto &[key, histogram] : evidence) {
+        auto [run, tier] = key;
+        for (auto [length, count] : histogram)
+          outputs[".run-evidence.tsv"] << name << '\t' << run << '\t' << ref[run] << '\t'
+                                       << o.tiers[tier % o.tiers.size()].label << '\t'
+                                       << (tier < int(o.tiers.size()) ? "UNIQUE" : "AMBIGUOUS")
+                                       << '\t' << length << '\t' << count << '\n';
+      }
+      evidence.clear();
+      std::vector<uint8_t>().swap(evidence_mask);
       std::vector<size_t> prefix(ref.size() + 1);
       std::string draft;
       // prefix is the exact HPC-run -> draft-base coordinate transform; the
@@ -697,14 +992,24 @@ int main(int argc, char **argv) {
             continue;
           auto it = overflow.find(i * histogram_tiers + t);
           Call candidate;
+          auto model = models.find(bin.tier % int(o.tiers.size()));
           if (it == overflow.end()) {
             if (bin.count >= o.min_support)
               candidate = {bin.length, bin.count, bin.count, bin.tier};
+            if (c.tier < 0 && candidate.tier >= 0 && model != models.end()) {
+              candidate.length = model->second.estimate_single(ref[i], bin.length, bin.count);
+              model_changed_runs += candidate.length != bin.length;
+            }
           } else {
             it->second[bin.length] = bin.count;
-            candidate = call({it->second}, o.min_support);
+            candidate = call({it->second}, o.min_support, o.experiment_mean);
             if (candidate.tier >= 0)
               candidate.tier = bin.tier;
+            if (c.tier < 0 && candidate.tier >= 0 && model != models.end()) {
+              auto calibrated = model->second.estimate(ref[i], it->second, candidate.length);
+              model_changed_runs += calibrated != candidate.length;
+              candidate.length = calibrated;
+            }
             overflow.erase(it);
           }
           if (c.tier < 0 && candidate.tier >= 0)
@@ -714,16 +1019,40 @@ int main(int argc, char **argv) {
           ++no_evidence;
           require(!o.missing_error, "No evidence at " + name + ":" + std::to_string(i));
         }
+        bool ambiguous_call = c.tier >= int(o.tiers.size());
+        ambiguous_run_calls += ambiguous_call;
         prefix[i] = draft.size();
         draft.append(c.length, ref[i]);
         prefix[i + 1] = draft.size();
         calls << name << '\t' << i << '\t' << prefix[i] << '\t' << prefix[i + 1] << '\t' << ref[i]
-              << '\t' << c.length << '\t' << (c.tier < 0 ? "NO_EVIDENCE" : o.tiers[c.tier].label)
-              << '\t' << c.depth << '\t' << c.peak << '\n';
+              << '\t' << c.length << '\t'
+              << (c.tier < 0 ? "NO_EVIDENCE" : o.tiers[c.tier % o.tiers.size()].label) << '\t'
+              << c.depth << '\t' << c.peak << '\t'
+              << (c.tier < 0       ? "NONE"
+                  : ambiguous_call ? "AMBIGUOUS"
+                                   : "UNIQUE")
+              << '\n';
       }
       std::vector<RunBin>().swap(bins);
       overflow.clear();
       memory_stage("draft called");
+      size_t crop_begin = 0, crop_end = draft.size();
+      if (o.region) {
+        require(o.region_begin < draft.size(), "Region starts beyond draft length");
+        crop_begin = o.region_begin;
+        crop_end = std::min(o.region_end, draft.size());
+        // Prefix calling establishes raw coordinates. Expensive raw alignment
+        // and polishing only need reads overlapping the requested raw context.
+        size_t context_begin = crop_begin > o.region_flank ? crop_begin - o.region_flank : 0;
+        size_t context_end = std::min(draft.size(), o.region_end + o.region_flank);
+        for (auto &w : work)
+          if (w.reason.empty() &&
+              (prefix[w.hend] <= context_begin || prefix[w.hbegin] >= context_end)) {
+            w.reason = "OUTSIDE_REGION_CONTEXT";
+            std::string().swap(w.trace);
+            w.a.shared_sequence.reset();
+          }
+      }
       if (o.polish || !o.cram.empty()) {
         parallel(work.size(), o.threads, [&](size_t i) {
           auto &w = work[i];
@@ -781,13 +1110,30 @@ int main(int argc, char **argv) {
       memory_stage("raw alignments complete");
       std::vector<Accepted> edits;
       if (o.polish) {
-        write_fasta(outputs[".draft.fasta"], name, draft);
+        write_fasta(outputs[".draft.fasta"], name, draft.substr(crop_begin, crop_end - crop_begin));
         std::vector<const Alignment *> alns;
         for (auto &w : work)
-          if (w.reason.empty() && w.unique)
+          if (w.reason.empty() && (w.unique || (o.ambiguous_fallback && w.placements > 1))) {
+            // Borrow alignments without copying their traces. Temporary tier
+            // ranks preserve the unique-first policy used by run voting.
+            if (!w.unique)
+              w.a.tier += o.tiers.size();
             alns.push_back(&w.a);
-        edits =
-            polish(draft, alns, o.tiers.size(), o.polish_support, o.polish_fraction, o.max_indel);
+          }
+        edits = polish(draft, alns, o.tiers.size() * (o.ambiguous_fallback ? 2 : 1),
+                       o.polish_support, o.polish_fraction, o.max_indel);
+        for (auto &w : work)
+          if (w.a.tier >= int(o.tiers.size()))
+            w.a.tier -= o.tiers.size();
+        // A crop boundary must not split a replacement allele or lose its VCF
+        // anchor. Leave such boundary events unchanged, rather than inventing a
+        // partial allele. Context is still used to evaluate interior candidates.
+        if (o.region)
+          edits.erase(std::remove_if(edits.begin(), edits.end(),
+                                     [&](const Accepted &e) {
+                                       return e.edit.begin <= crop_begin || e.edit.end >= crop_end;
+                                     }),
+                      edits.end());
         n_edits += edits.size();
         memory_stage("polishing complete");
         for (const auto &e : edits) {
@@ -799,12 +1145,21 @@ int main(int argc, char **argv) {
             rb = draft[p] + rb;
             ab = draft[p] + ab;
           }
-          outputs[".non-hpc-edits.vcf"] << name << '\t' << p + 1 << "\t.\t" << rb << '\t' << ab
-                                        << "\t.\tPASS\tTIER=" << o.tiers[e.tier].label
-                                        << ";DP=" << e.depth << ";AC=" << e.support << '\n';
+          outputs[".non-hpc-edits.vcf"]
+              << name << '\t' << p - crop_begin + 1 << "\t.\t" << rb << '\t' << ab
+              << "\t.\tPASS\tTIER=" << o.tiers[e.tier % o.tiers.size()].label << ";DP=" << e.depth
+              << ";AC=" << e.support << '\n';
         }
       }
       std::string final = hpc::apply(draft, edits);
+      size_t final_begin = lift(crop_begin, edits), final_end = lift(crop_end, edits);
+      std::string region_reference;
+      if (o.region) {
+        outputs[".region.tsv"] << name << '\t' << crop_begin << '\t' << crop_end << '\t'
+                               << final_begin << '\t' << final_end << '\t' << ref.size() << '\n';
+        region_reference = std::move(final);
+        final = region_reference.substr(final_begin, final_end - final_begin);
+      }
       write_fasta(fa, name, final);
       refs.emplace_back(name, final.size());
       if (!o.cram.empty()) {
@@ -821,12 +1176,17 @@ int main(int argc, char **argv) {
             try {
               if (touches) {
                 ++base_alignments;
+                // Realign against the polished context before rebasing to the crop.
+                auto target =
+                    (o.region ? region_reference : final).substr(w.a.begin, w.a.end - w.a.begin);
                 w.a.ops =
                     align(w.a.bases().substr(w.a.clip_left,
                                              w.a.bases().size() - w.a.clip_left - w.a.clip_right),
-                          final.substr(w.a.begin, w.a.end - w.a.begin), o.max_error);
+                          target, o.max_error);
                 w.a.packed_ops = false;
               }
+              if (o.region && !crop_alignment(w.a, final_begin, final_end))
+                continue;
               size_t nm;
               auto mdtag = md(w.a, final, nm);
               std::string c;
@@ -864,6 +1224,8 @@ int main(int argc, char **argv) {
                              << ",\n  \"dropped\": " << dropped
                              << ",\n  \"exact_hpc_reads\": " << exact
                              << ",\n  \"no_evidence_runs\": " << no_evidence
+                             << ",\n  \"ambiguous_run_calls\": " << ambiguous_run_calls
+                             << ",\n  \"model_changed_runs\": " << model_changed_runs
                              << ",\n  \"non_hpc_edits\": " << n_edits
                              << ",\n  \"base_alignments\": " << base_alignments
                              << ",\n  \"cram_records\": " << n_cram << "\n}\n";

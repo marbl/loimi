@@ -49,6 +49,69 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
     run(base + ["--output", root / "fast"])
     assert sequence(root / "fast.fasta") == "AAAAACCGTTT"
     assert (root / "fast.fasta").read_text().startswith(">tig00000001\n")
+    # Calibration exports every tier before priority selection, but only at
+    # requested HPC indexes. Read exclusions must not alter the called FASTA.
+    (root / "sites.tsv").write_text("tig00000001\t0\n")
+    first_high = next(row.split("\t")[1] for row in
+                      (root / "fast.read-decisions.tsv").read_text().splitlines()[1:]
+                      if row.split("\t")[2] == "reads_high_0")
+    (root / "exclude.ids").write_text(first_high + "\n")
+    run(base + ["--evidence-sites", root / "sites.tsv", "--evidence-exclude-reads",
+                root / "exclude.ids", "--output", root / "evidence"])
+    assert (root / "evidence.fasta").read_bytes() == (root / "fast.fasta").read_bytes()
+    evidence = [r.split("\t") for r in (root / "evidence.run-evidence.tsv").read_text().splitlines()[1:]]
+    assert all(r[1] == "0" for r in evidence)
+    observed = {(r[3], r[4], int(r[5])): int(r[6]) for r in evidence}
+    assert observed[("high", "UNIQUE", 5)] == 2
+    assert observed[("high", "UNIQUE", 6)] == 2
+    assert observed[("high", "UNIQUE", 20)] == 1
+    assert observed[("low", "UNIQUE", 2)] == 10
+    assert any(r[4] == "AMBIGUOUS" for r in evidence)
+    # An optional per-tier model changes length, not tier eligibility. Missing
+    # base rows retain mode, and malformed/unknown model assignments fail early.
+    model_rows = ["HPC_RUN_MODEL_V1 20 5"]
+    for length in range(1, 7):
+        weights = [1.0] * 21
+        for observed in ([5, 6, 20] if length == 6 else [length]):
+            weights[observed] = 100.0
+        total = sum(weights)
+        model_rows.append(f"A {length} 100 " + " ".join(str(x/total) for x in weights))
+    (root / "high.model").write_text("\n".join(model_rows) + "\n")
+    run(base + ["--tier-model", f"high={root / 'high.model'}", "--output", root / "modeled"])
+    assert sequence(root / "modeled.fasta") == "AAAAAACCGTTT"
+    assert json.loads((root / "modeled.summary.json").read_text())["model_changed_runs"] == 1
+    if shutil.which("samtools"):
+        run(base + ["--tier-model", f"high={root / 'high.model'}", "--output", root / "modeled-cram",
+                    "--cram", root / "modeled.cram"])
+        assert sequence(root / "modeled-cram.fasta") == "AAAAAACCGTTT"
+        checked = run(["samtools", "calmd", root / "modeled.cram", root / "modeled-cram.fasta"])
+        assert "different" not in checked.stderr
+    run(base + ["--tier-model", f"unknown={root / 'high.model'}", "--output", root / "bad-model-tier"], ok=False)
+    run(base + ["--tier-model", f"high={root / 'high.model'}", "--experiment-run-mean",
+                "--output", root / "bad-model-mean"], ok=False)
+    # Raw crop boundaries can fall within a homopolymer. Polishing and CRAM are
+    # independent switches; region names stay canonical and SAM is crop-relative.
+    for mode in ("fast", "polish", "cram", "both"):
+        if mode in ("cram", "both") and not shutil.which("samtools"):
+            continue
+        label = f"region-{mode}"
+        args = base + ["--region", "tig00000001:2-9", "--output", root / label]
+        if mode in ("polish", "both"):
+            args += ["--polish-non-hpc"]
+        if mode in ("cram", "both"):
+            args += ["--cram", root / f"{label}.cram"]
+        run(args)
+        assert sequence(root / f"{label}.fasta") == "AAACCGT"
+        if mode in ("cram", "both"):
+            rows = run(["samtools", "view", root / f"{label}.cram"]).stdout.splitlines()
+            ambiguous = [r.split("\t") for r in rows if r.startswith("reads_ambiguous\t")]
+            assert len(ambiguous) == 2 and all(int(r[4]) == 3 for r in ambiguous)
+            assert all(r.split("\t")[3] == "1" and "S" in r.split("\t")[5] for r in rows)
+            checked = run(["samtools", "calmd", root / f"{label}.cram", root / f"{label}.fasta"])
+            assert "different" not in checked.stderr
+    for i, region in enumerate(("tig00000001:9-2", "tig00000001:-1-3", "tig00000002:0-10",
+                                "tig00000001:100-200")):
+        run(base + ["--region", region, "--output", root / f"bad-region-{i}"], ok=False)
     # Template numbering need not match native package numbering. A conflicting
     # numeric header must not override the explicitly mapped template name.
     (root / "mapped.fa").write_text(">piece000111\nACGT\n>1\nTGCA\n")
@@ -71,8 +134,43 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
         run(mapped + ["--tig-map", root / "bad.map", "--output", root / label], ok=False)
     metrics = json.loads((root / "fast.summary.json").read_text())
     assert metrics["base_alignments"] == 0 and metrics["cram_records"] == 0
-    assert metrics["dropped"] == 2
-    assert "AMBIGUOUS_PLACEMENT" in (root / "fast.read-decisions.tsv").read_text()
+    assert metrics["dropped"] == 0
+    # Unique evidence wins even over a higher-quality ambiguous tier; ambiguous
+    # evidence is used only in the uncovered tail and does not require CRAM.
+    fallback_records = [(n, "A" * 40 + "CCGTTTGGAACCTT" if n == "ambiguous" else s)
+                        for n, s in records]
+    (root / "fallback.fa").write_text("".join(f">{n}\n{s}\n" for n, s in fallback_records))
+    fallback_rows = [f"fallback_{n}\t0\t{8 if n == 'ambiguous' else 4}\t{2 if n == 'ambiguous' else 1}"
+                     for n, s in fallback_records if n != "reverse"]
+    (root / "fallback.layout").write_text(f"tig\tfallback\nlen\t8\nrds\t{len(fallback_rows)}\n" + "\n".join(fallback_rows) + "\nend\n")
+    (root / "fallback.template.fa").write_text(">1\nACGTGACT\n")
+    run([tools / "sqStoreCreate", "-o", root / "fallback.seqStore", "-minlength", "1", "-raw", "-pacbio", "fallback", root / "fallback.fa"])
+    run([tools / "layoutToPackage", "-layout", root / "fallback.layout", "-store", root / "fallback.seqStore", "-output", root / "fallback#.fpack"])
+    fallback_base = [exe, "--import", next(root.glob("*.fpack")), "--template-hpc", root / "fallback.template.fa",
+                     "--tier", "amb=fallback_ambiguous", "--tier", "high=fallback_high_*", "--tier", "low=*"]
+    run(fallback_base + ["--unique-only", "--output", root / "fallback-default"])
+    run(fallback_base + ["--output", root / "fallback-enabled"])
+    assert sequence(root / "fallback-default.fasta") == "AAAAACCGTTTGACT"
+    assert sequence(root / "fallback-enabled.fasta") == "AAAAACCGTTTGGAACCTT"
+    fallback_metrics = json.loads((root / "fallback-enabled.summary.json").read_text())
+    assert fallback_metrics["no_evidence_runs"] == 0 and fallback_metrics["ambiguous_run_calls"] == 4
+    # Polishing uses the same unique-first groups, without leaking temporary
+    # group ranks into exported read-group labels.
+    pol_reads = [(f"u{i}", "ACGT", 4, 1) for i in range(6)] + [(f"a{i}", "ACGTGAGT", 8, 2) for i in range(6)]
+    (root / "polfallback.fa").write_text("".join(f">{n}\n{s}\n" for n, s, _, _ in pol_reads))
+    (root / "polfallback.layout").write_text("tig\tpolfallback\nlen\t8\nrds\t12\n" + "".join(f"polfallback_{n}\t0\t{e}\t{copies}\n" for n, s, e, copies in pol_reads) + "end\n")
+    run([tools / "sqStoreCreate", "-o", root / "polfallback.seqStore", "-minlength", "1", "-raw", "-pacbio", "polfallback", root / "polfallback.fa"])
+    run([tools / "layoutToPackage", "-layout", root / "polfallback.layout", "-store", root / "polfallback.seqStore", "-output", root / "polfallback#.pfpack"])
+    args = [exe, "--import", next(root.glob("*.pfpack")), "--template-hpc", root / "fallback.template.fa", "--tier", "high=polfallback_u*", "--tier", "low=*", "--polish-non-hpc", "--output", root / "polfallback"]
+    if shutil.which("samtools"):
+        args += ["--cram", root / "polfallback.cram"]
+    run(args)
+    assert sequence(root / "polfallback.fasta") == "ACGTGAGT"
+    assert "TIER=low" in (root / "polfallback.non-hpc-edits.vcf").read_text()
+    if shutil.which("samtools"):
+        checked = run(["samtools", "calmd", root / "polfallback.cram", root / "polfallback.fasta"])
+        assert "different" not in checked.stderr
+    assert "AMBIGUOUS_PLACEMENT" in (root / "fallback-default.read-decisions.tsv").read_text()
     run(base + ["--output", root / "serial", "--threads", "1"])
     assert (root / "serial.fasta").read_bytes() == (root / "fast.fasta").read_bytes()
     assert (root / "serial.run-calls.tsv").read_bytes() == (root / "fast.run-calls.tsv").read_bytes()
@@ -132,6 +230,32 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
     assert sequence(root / "fix-polish.fasta") == "ACATACGT"
     assert sequence(root / "fix-polish.draft.fasta") == "ACGTACGT"
     assert json.loads((root / "fix-polish.summary.json").read_text())["non_hpc_edits"] == 1
+    args = fixbase + ["--region", "tig00000001:1-7", "--polish-non-hpc", "--output", root / "fix-region"]
+    if shutil.which("samtools"):
+        args += ["--cram", root / "fix-region.cram"]
+    run(args)
+    assert sequence(root / "fix-region.fasta") == "CATACG"
+    assert sequence(root / "fix-region.draft.fasta") == "CGTACG"
+    vcf_rows = [r for r in (root / "fix-region.non-hpc-edits.vcf").read_text().splitlines() if not r.startswith("#")]
+    assert len(vcf_rows) == 1 and vcf_rows[0].split("\t")[1] == "2"
+    if shutil.which("samtools"):
+        checked = run(["samtools", "calmd", root / "fix-region.cram", root / "fix-region.fasta"])
+        assert "different" not in checked.stderr
+    # A regional non-HPC insertion changes final length, not the draft-defined
+    # biological interval. Its CRAM must align against the lifted crop boundaries.
+    (root / "ins.fa").write_text("".join(f">r{i}\nACGATACGT\n" for i in range(6)))
+    (root / "ins.layout").write_text("tig\tins\nlen\t8\nrds\t6\n" + "".join(f"ins_r{i}\t0\t8\t1\n" for i in range(6)) + "end\n")
+    run([tools / "sqStoreCreate", "-o", root / "ins.seqStore", "-minlength", "1", "-raw", "-pacbio", "ins", root / "ins.fa"])
+    run([tools / "layoutToPackage", "-layout", root / "ins.layout", "-store", root / "ins.seqStore", "-output", root / "ins#.ipack"])
+    args = [exe, "--import", next(root.glob("*.ipack")), "--template-hpc", root / "fix.template.fa", "--tier", "*", "--region", "tig00000001:1-7", "--polish-non-hpc", "--output", root / "ins-region"]
+    if shutil.which("samtools"):
+        args += ["--cram", root / "ins-region.cram"]
+    run(args)
+    assert sequence(root / "ins-region.draft.fasta") == "CGTACG"
+    assert sequence(root / "ins-region.fasta") == "CGATACG"
+    if shutil.which("samtools"):
+        checked = run(["samtools", "calmd", root / "ins-region.cram", root / "ins-region.fasta"])
+        assert "different" not in checked.stderr
     if shutil.which("samtools"):
         rows = run(["samtools", "view", root / "fix.cram"]).stdout.splitlines()
         assert len(rows) == 6 and all("NM:i:0" in r and "MD:Z:8" in r for r in rows)
@@ -188,6 +312,29 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
             assert int(row[2]) == int(row[0].removeprefix("tig"))-1 and row[6] == "SPARSE"
     fa = (root / "multi.fasta").read_text()
     assert ">tig00000007\nAACCCGT\n" in fa and ">tig00000008\nAACCCGT\n" in fa
+    # A native fixture preserves serialized read names, orientation and declared
+    # ambiguity. Full-span extraction must reproduce the same tig sequence.
+    (root / "extract.tsv").write_text(f"{root / 'extracted'}\t0\t400\n")
+    run([exe.parent / "extract-regions", packs[0], "1", "37", root / "extract.tsv"])
+    extracted_args = [exe, "--import", root / "extracted.cnspack", "--template-hpc", root / "multi.template.fa", "--tier", "*", "--output", root / "extracted-result"]
+    if shutil.which("samtools"):
+        extracted_args += ["--cram", root / "extracted-result.cram"]
+    run(extracted_args)
+    assert sequence(root / "extracted-result.fasta") == fa.split(">tig00000001\n")[1].split(">")[0].replace("\n", "")
+    multi_region_base = [exe, "--import", packs[0], "--template-hpc", root / "multi.template.fa", "--tier", "*"]
+    for tid in (1, 3, 7, 8):
+        label = f"multi-region-{tid}"
+        end = 60 if tid < 7 else 5
+        args = multi_region_base + ["--region", f"tig{tid:08d}:2-{end}", "--region-flank", "10", "--output", root / label]
+        if shutil.which("samtools"):
+            args += ["--cram", root / f"{label}.cram"]
+        run(args)
+        full = fa.split(f">tig{tid:08d}\n")[1].split(">")[0].replace("\n", "")
+        assert sequence(root / f"{label}.fasta") == full[2:end]
+        assert (root / f"{label}.fasta").read_text().count(">") == 1
+        if shutil.which("samtools"):
+            checked = run(["samtools", "calmd", root / f"{label}.cram", root / f"{label}.fasta"])
+            assert "different" not in checked.stderr
     if shutil.which("samtools"):
         sam = run(["samtools", "view", root / "multi.cram"]).stdout.splitlines()
         assert all(row.split("\t")[2].startswith("tig000000") for row in sam)

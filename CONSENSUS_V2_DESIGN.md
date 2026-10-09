@@ -1,6 +1,6 @@
 # Design status and implementation guide
 
-Updated: 2026-10-07
+Updated: 2026-10-09
 
 This file includes the original 2026-10-02 proposal below for rationale and
 research context. It is historical: where it conflicts with this status section,
@@ -9,6 +9,21 @@ behavior. Proposed options and guarantees below are not automatically supported.
 
 ## Current implementation versus original proposal
 
+- Optional `--tier-model LABEL=FILE` associates calibrated conditional run-length
+  likelihoods with each technology tier. Mode remains the default/fallback;
+  models do not change tier eligibility. Sampled all-tier HPC evidence export
+  supports separate training and held-out validation. Model formats and limits
+  are documented in README; models are not universal chemistry defaults.
+- Consensus now prefers all unique tiers before falling back through non-unique
+  tiers, rather than leaving ambiguous-only regions at run length one.
+  `--unique-only` retains the old policy for comparisons. Offset inference still
+  requires unique anchors. The run-length mode remains the default; a rounded
+  mean option is explicitly experimental and not a validated replacement.
+- Regional iteration supports one `--region tigID:BEGIN-END` in uncompressed
+  draft coordinates, with context and cropped FASTA/CRAM/VCF output. It retains
+  prefix-overlapping reads after separate offset discovery, while preserving
+  full-package multiplicity. It still scans the package sequentially and calls
+  the prefix through END; see README for coordinate and memory limitations.
 - C++20, native Verkko package readers, and unit-cost edlib alignment are
   implemented. Affine-gap ksw2/WFA backends and direct reuse of packaged CIGARs
   remain proposals, not implemented paths.
@@ -23,7 +38,7 @@ behavior. Proposed options and guarantees below are not automatically supported.
 - Boundary-crossing reads are retained with semi-global HPC overlap alignment
   and raw soft clips. Partially clipped runs cannot donate truncated lengths.
 - The legacy `skipConsensus` flag is ignored. Explicit ordered wildcard tiers
-  determine priority; only uniquely placed observations vote for consensus.
+  determine priority; all unique tiers precede the non-unique fallback group.
 - Distinct repeated placements are allowed in CRAM. The first successfully
   emitted occurrence is primary; later ones are secondary with equal
   multiplicity-adjusted MAPQ. This supersedes the original single-record policy.

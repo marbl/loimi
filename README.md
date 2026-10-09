@@ -19,9 +19,10 @@ Standalone C++ prototype for expanding a fixed homopolymer-compressed (HPC)
 template using reads and placements from Verkko `.cnspack` files. It reuses the
 native Canu/Verkko package reader; it does not use POA or remap reads genome-wide.
 
-Status: functional prototype, October 6, 2026. Synthetic native-package tests
-pass; biological accuracy and genome-scale resource use have not yet been
-validated. The existing Verkko pipeline is not modified.
+Status: experimental prototype, October 8, 2026. Synthetic native-package tests
+pass, but a user-reported human chromosome benchmark showed substantially worse
+Merqury QV than mature Verkko consensus (40.98 versus 69.6). This is not a
+production-accuracy replacement. The existing Verkko pipeline is not modified.
 
 ## Build
 
@@ -104,6 +105,43 @@ The default does not perform raw-base realignment, correction, or CRAM creation.
 It can still align compressed read sequences within their known layout intervals
 to establish run correspondence when they do not exactly match the template.
 
+## Regional iteration
+
+To process only the first 10 Mb of internal tig 109, add:
+
+```sh
+--region tig00000109:0-10000000 --region-flank 100000
+```
+
+Coordinates are zero-based, half-open **uncompressed draft** bases, not HPC
+runs, template-name suffixes, or mature Verkko consensus coordinates. Polishing
+translates these boundaries through accepted edits; final length can therefore
+differ from the requested length. An end beyond the contig is clamped; a start
+beyond it is an error. Only one region is accepted per invocation.
+
+The implementation counts placements across the entire package, scans again to
+retain at most 32 ranked offset anchors, then retains only reads overlapping a
+conservative HPC prefix. Since every run expands to at least one base, END plus
+the flank bounds the required number of HPC runs. Full overlapping placements
+are retained as context. Raw alignment/polishing is restricted to reads overlapping
+the requested draft interval plus the flank. The flank is used conservatively in
+HPC runs during read selection and in raw bases during polishing selection.
+
+This is not just output truncation, but it is also not random access: all native
+read records are scanned three times, and complete template strings and placement
+metadata are still loaded. For a nonzero start, run calling must process the
+prefix through END to establish raw coordinates. Long boundary-spanning reads can
+extend the working prefix. No chromosome-scale memory bound has been measured.
+
+FASTA, CRAM and edit VCF use the canonical tig name with crop-relative coordinates;
+CRAM contains overlapping alignments soft-clipped to the final crop, with original
+placement multiplicities retained. Edits touching a crop boundary are not applied.
+`.region.tsv` records the draft crop, corresponding polished-prefix boundaries,
+and processed HPC prefix length. Multi-read `.run-calls.tsv` keeps **prefix** run
+and draft coordinates, including context; singleton run calls are crop-relative.
+Summary counts describe processed evidence/context, not exclusively emitted bases.
+Separate regions of the same tig have the same name: keep their outputs separate.
+
 ## Calling rules
 
 Template offsets are inferred independently for each tig. The tool tries up to
@@ -134,16 +172,23 @@ evidence, not validated confidence.
 
 A tig containing exactly one packaged read bypasses inference and consensus:
 its oriented, clipped sequence is output directly, without requiring a template.
-It must still be uniquely placed and match an accepted tier. Run support
+It must match an accepted tier and have a known placement count. Run support
 thresholds do not apply to passthrough. Optional CRAM preserves the original
 oriented read and soft clips, with a perfect match to the emitted sequence.
 Polishing leaves singleton sequences unchanged. No offset is inferred (reported
 as `.`), and run-call coordinates describe the passthrough sequence.
 
-Only placements with packaged placement count exactly one and no distinct
-alternative in the input package are eligible for consensus and offset inference.
-Ambiguous reads are excluded from consensus, but their distinct placements are
-aligned and exported when CRAM is requested. The legacy `skipConsensus` flag is ignored:
+Placements with packaged placement count exactly one and no distinct alternative
+in the input package are unique. Consensus searches all unique tiers first, then
+all known non-unique tiers in the same user-specified order. Thus unique UL beats
+non-unique LA, but non-unique LA can fill regions with no usable unique evidence.
+This applies to run calling and optional non-HPC polishing, using their respective
+support thresholds. `--unique-only` restores the original strict filtering for
+controlled comparisons; `--ambiguous-fallback` explicitly selects the default.
+Unknown placement counts (zero) remain export-only. Offset discovery still needs
+unique anchors; entirely ambiguous multi-read tigs are not yet supported.
+All distinct eligible placements are exported when CRAM is requested.
+The legacy `skipConsensus` flag is ignored:
 explicit user tiers replace its template-building priority policy. Any number
 of ordered tiers is supported. All eligible reads can be aligned and exported
 to CRAM, even if their tier never wins a consensus call. Repeated IDs are allowed
@@ -157,6 +202,27 @@ cannot outvote it. The called length is the empirical histogram mode. Tied modes
 are resolved by minimum total absolute distance to observations, then smaller
 length. This is not a fitted or smoothed distribution model. Quality priority is
 entirely user-specified by tiers, not per-base quality scores.
+
+`--experiment-run-mean` instead rounds the empirical mean of the selected
+distribution. This is an experimental diagnostic, not a validated accuracy
+improvement; the modal caller remains the default. `.run-calls.tsv` reports
+`placement_class` as UNIQUE, AMBIGUOUS or NONE, and summary JSON counts
+`ambiguous_run_calls` separately. The `peak` column is still the histogram's
+modal count, including when the experimental mean is used.
+
+For native regional fixtures, the build also includes `extract-regions`:
+
+```sh
+build/extract-regions input.cnspack 109 3424 regions.tsv
+```
+
+Each regions.tsv row is `output_prefix HPC_begin HPC_end` in original-template
+zero-based half-open coordinates. The offset must be independently verified.
+The utility extends each window to retain full overlapping reads, copies native
+read records verbatim, rebases layout positions, and preserves original ambiguity
+(the native placement-count field saturates at 31). Output `.span.tsv` gives the
+template slice to supply; `.placements.tsv` retains original positions for
+coverage diagnostics. It does not automatically extract template/truth FASTAs.
 
 Without eligible evidence a run gets length one and is reported as
 `NO_EVIDENCE`; `--missing-run error` instead stops the run. N runs do not collect
@@ -249,6 +315,97 @@ the prototype test covers only the main tig). This is not production validation.
 The repository-local [design proposal](CONSENSUS_V2_DESIGN.md) includes current
 implementation status, historical rationale, and future work;
 this README describes the implemented prototype.
+
+## Optional per-tier run-length calibration
+
+Attach a separate model to any named tier; tiers without a model keep the mode
+caller. Models do not alter tier order, unique-placement preference, eligibility,
+singleton pass-through, or the optional polishing/CRAM stages.
+
+```bash
+--tier 'LA=hifi_m*' --tier 'LAO=hifi_[0-9a-ln-z]*' --tier 'UL=ont_*' \
+--tier-model LA=LA.run-model.tsv \
+--tier-model LAO=LAO.run-model.tsv \
+--tier-model UL=UL.run-model.tsv
+```
+
+These are **dataset/chemistry-specific experimental models**, not universal
+technology defaults. Validate a model after changing the read-generation or
+correction pipeline. No pretrained model is bundled. Mode remains the fallback
+below the model's minimum depth, for an unmodeled base, or when the original
+modal length is outside that base's calibrated range. Models cannot be combined
+with `--experiment-run-mean`. The summary reports `model_changed_runs`, and
+`.models.tsv` records tier-to-file associations. Run-call `peak` remains the
+modal observation count, **not** a calibrated confidence score.
+
+Model files are whitespace-separated text, with optional `#` comment lines:
+
+```text
+HPC_RUN_MODEL_V1 OBSERVED_MAX MINIMUM_DEPTH
+BASE TRUE_LENGTH TRAINING_LOCI P_OBS_0 P_OBS_1 ... P_OBS_MAX
+```
+
+For each A/C/G/T base present, rows must enumerate contiguous true lengths from
+one, in ascending order. Each row has `OBSERVED_MAX+1` finite positive
+probabilities summing to one. The final observed bin includes all lengths at
+least `OBSERVED_MAX`. Prediction maximizes the sum of histogram counts times
+log conditional probabilities; ties favor the shorter length. There is no
+implicit length prior. Correlated reads require separate confidence calibration.
+Keep training provenance and the model checksum alongside each model file.
+
+For calibration, `--evidence-sites FILE` accepts `TIG RUN` rows (canonical output
+tig names, zero-based **input-template HPC** indexes), exporting
+`.run-evidence.tsv`: `tig,run,base,tier,placement_class,length,count` as TSV.
+This observes accepted, non-truncated HPC votes **before tier prioritization**,
+including lower tiers. Unique and ambiguous votes remain separate; unknown
+placement counts remain ineligible. `--unique-only` also excludes ambiguous
+votes from this export. `--evidence-exclude-reads FILE` takes one numeric read ID
+per whitespace-delimited token and excludes them from the diagnostic only,
+useful for preventing training/validation read overlap. Neither switch changes
+the consensus. Singleton pass-through produces no histogram evidence. Use
+native extracted fixtures rather than `--region` with this export.
+
+Evidence export adds one byte per template run plus sparse histograms only at
+requested sites. Sample sites for calibration rather than exporting every run
+of a whole chromosome. Model storage is shared across runs; homogeneous
+histograms use precomputed single-allele predictions.
+
+`scripts/calibrate_runs.py` is an experimental LA/LAO/UL trainer/evaluator:
+
+```bash
+python3 scripts/calibrate_runs.py --data /path/to/calibration-data train
+python3 scripts/calibrate_runs.py --data /path/to/calibration-data validate
+```
+
+The dataset's `manifest.json` contains `windows` entries with `name` and `split`
+(`train` or `validation`). Each named subdirectory contains `labels.tsv`
+(`run`, `base`, `truth_length`), the native `.run-evidence.tsv` export named
+`consensus.run-evidence.tsv`, `consensus.summary.json` as the completion marker,
+and `label-summary.json` describing labeling coverage/exclusions. Labels must
+come from trusted, unambiguous truth alignments in the same HPC coordinate
+system. Prevent read sharing across the split before exporting evidence.
+Exported sites without an accepted truth label are ignored, allowing stricter
+truth masks without rerunning the read alignments.
+
+The trainer uses unique placements, one unit of histogram mass per locus,
+base-family smoothing, and a small outlier component. It requires 30 labeled
+loci per base/true length and stores only contiguous supported ranges from one.
+The generated models require at least five observations for prediction. These
+are explicit experimental choices recorded in `models/metadata.json`, not
+universal recommended settings. The current sampling contract is all labeled
+truth runs of length >=10 plus 1/100 shorter runs; weighted summaries are valid
+only for that design and do not account for excluded/unmappable truth regions.
+
+Training reads only `train` windows and refuses to overwrite frozen models.
+Validation checks model checksums and split names, writes `validation.json`,
+and never refits. It reports individual tiers, ambiguity classes, depth/length
+strata, and LA-first/LAO-first priority simulations. These are sampled run
+errors, not full-sequence QV. Keep an additional independent dataset for final
+assessment when comparing or tuning models against these validation results.
+
+For predictor parity checks, `build/apply-run-model MODEL` reads stdin rows
+`BASE LENGTH:COUNT [LENGTH:COUNT ...]` and prints the mode and calibrated call.
+This diagnostic uses the production C++ predictor without rerunning alignments.
 
 ## Memory behavior
 

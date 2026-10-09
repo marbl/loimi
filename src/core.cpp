@@ -7,10 +7,102 @@
 #include <fnmatch.h>
 #include <limits>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 
 namespace hpc {
+RunModel RunModel::read(std::istream &input) {
+  RunModel model;
+  std::string line;
+  bool header = false;
+  while (std::getline(input, line)) {
+    if (line.empty() || line[0] == '#')
+      continue;
+    std::istringstream row(line);
+    if (!header) {
+      std::string magic, extra;
+      if (!(row >> magic >> model.observed_max >> model.minimum_depth) ||
+          magic != "HPC_RUN_MODEL_V1" || model.observed_max < 1 || model.observed_max > 1000 ||
+          model.minimum_depth < 1 || model.minimum_depth > 1000000 || (row >> extra))
+        throw std::runtime_error("Invalid run model header");
+      header = true;
+      continue;
+    }
+    char base;
+    size_t truth, loci;
+    if (!(row >> base >> truth >> loci) || std::string("ACGT").find(base) == std::string::npos ||
+        truth < 1 || truth > 1000 || loci < 1)
+      throw std::runtime_error("Invalid run model row");
+    auto &rows = model.log_probabilities[base];
+    if (truth != rows.size() + 1)
+      throw std::runtime_error("Run model lengths must be contiguous from one per base");
+    std::vector<double> probabilities(model.observed_max + 1);
+    double sum = 0;
+    for (double &p : probabilities) {
+      if (!(row >> p) || !std::isfinite(p) || p <= 0 || p > 1)
+        throw std::runtime_error("Run model probabilities must be finite and positive");
+      sum += p;
+      p = std::log(p);
+    }
+    std::string extra;
+    if ((row >> extra) || std::abs(sum - 1) > 1e-6)
+      throw std::runtime_error("Invalid run model probability row size or normalization");
+    rows.push_back(std::move(probabilities));
+  }
+  if (!input.eof() || !header || model.log_probabilities.empty())
+    throw std::runtime_error("Empty or unreadable run model");
+  for (const auto &[base, rows] : model.log_probabilities) {
+    auto &calls = model.single_allele_calls[base];
+    calls.resize(model.observed_max + 1);
+    for (size_t observed = 0; observed <= model.observed_max; ++observed) {
+      double best = -std::numeric_limits<double>::infinity();
+      for (size_t length = 0; length < rows.size(); ++length)
+        if (rows[length][observed] > best) {
+          best = rows[length][observed];
+          calls[observed] = length + 1;
+        }
+    }
+  }
+  return model;
+}
+
+uint32_t RunModel::estimate_single(char base, uint32_t observed, uint32_t depth) const {
+  // Avoid constructing an allocating map for the common single-allele run.
+  auto found = log_probabilities.find(base);
+  if (depth < minimum_depth || found == log_probabilities.end() || observed < 1 ||
+      observed > found->second.size())
+    return observed;
+  return single_allele_calls.at(base)[std::min<size_t>(observed, observed_max)];
+}
+
+uint32_t RunModel::estimate(char base, const Histogram &observations, uint32_t fallback) const {
+  auto found = log_probabilities.find(base);
+  if (found == log_probabilities.end() || fallback < 1 || fallback > found->second.size())
+    return fallback;
+  uint64_t depth = 0;
+  for (auto [length, count] : observations)
+    depth += count;
+  if (depth < minimum_depth)
+    return fallback;
+  if (observations.size() == 1)
+    return single_allele_calls.at(
+        base)[std::min<size_t>(observations.begin()->first, observed_max)];
+  double best = -std::numeric_limits<double>::infinity();
+  uint32_t result = fallback;
+  for (size_t length = 0; length < found->second.size(); ++length) {
+    double score = 0;
+    for (auto [observed, count] : observations)
+      score += count * found->second[length][std::min<size_t>(observed, observed_max)];
+    // Rows are ascending: exact score ties deterministically favor shorter runs.
+    if (score > best) {
+      best = score;
+      result = length + 1;
+    }
+  }
+  return result;
+}
+
 Rle encode(const std::string &s) {
   // Keep offsets temporary: eight bytes per read run becomes prohibitive if all
   // reads of a chromosome retain this representation at once.
@@ -182,7 +274,7 @@ int tier_of(const std::string &name, const std::vector<Tier> &tiers) {
       return i;
   return -1;
 }
-Call call(const std::vector<Histogram> &tiers, uint32_t min_support) {
+Call call(const std::vector<Histogram> &tiers, uint32_t min_support, bool rounded_mean) {
   // Qualify tiers by total observations, not by the modal count. A lower tier
   // cannot outvote a qualifying higher one, even with much greater coverage.
   for (size_t t = 0; t < tiers.size(); ++t) {
@@ -196,6 +288,13 @@ Call call(const std::vector<Histogram> &tiers, uint32_t min_support) {
       continue;
     if (n > UINT32_MAX)
       throw std::runtime_error("Coverage overflow");
+    if (rounded_mean) {
+      long double total = 0;
+      for (auto [length, count] : tiers[t])
+        total += static_cast<long double>(length) * count;
+      return {static_cast<uint32_t>(total / n + 0.5L), static_cast<uint32_t>(n), peak,
+              static_cast<int>(t)};
+    }
     uint32_t best = 0;
     uint64_t distance = UINT64_MAX;
     // Tied modes minimize total absolute deviation; sorted keys and strict '<'
@@ -216,6 +315,33 @@ Call call(const std::vector<Histogram> &tiers, uint32_t min_support) {
 }
 bool Edit::operator<(const Edit &o) const {
   return std::tie(begin, end, alt) < std::tie(o.begin, o.end, o.alt);
+}
+bool crop_alignment(Alignment &a, size_t begin, size_t end) {
+  if (begin >= end || a.end <= begin || a.begin >= end)
+    return false;
+  auto ops = a.packed_ops ? expand_cigar(a.ops) : a.ops;
+  size_t r = a.begin, left = 0, right = 0, query_kept = 0;
+  std::string kept;
+  for (char op : ops) {
+    bool inside = r >= begin && r < end;
+    if (inside) {
+      kept += op;
+      query_kept += op != 'D';
+    } else if (op != 'D') {
+      (r < begin ? left : right)++;
+    }
+    if (op != 'I')
+      ++r;
+  }
+  if (kept.empty() || query_kept == 0)
+    return false;
+  a.begin = std::max(a.begin, begin) - begin;
+  a.end = std::min(a.end, end) - begin;
+  a.clip_left += left;
+  a.clip_right += right;
+  a.ops = cigar(kept);
+  a.packed_ops = true;
+  return true;
 }
 std::vector<Edit> events(const Alignment &a, const std::string &ref) {
   // Coalesce consecutive non-matches into a single replacement allele. This

@@ -5,12 +5,37 @@
 #include <iostream>
 #include <stdexcept>
 #include <random>
+#include <sstream>
 using namespace hpc;
 static void check(bool v, const char *msg) {
   if (!v)
     throw std::runtime_error(msg);
 }
 int main() {
+  std::istringstream model_input("HPC_RUN_MODEL_V1 3 5\n"
+                                 "A 1 100 .01 .96 .02 .01\n"
+                                 "A 2 100 .01 .25 .4 .34\n"
+                                 "A 3 100 .01 .02 .8 .17\n");
+  auto model = RunModel::read(model_input);
+  check(model.estimate('A', {{2, 5}}, 2) == 3, "Calibrated single-allele likelihood");
+  check(model.estimate_single('A', 2, 5) == 3, "Allocation-free single-allele likelihood");
+  check(model.estimate_single('A', 2, 4) == 2, "Single-allele low-depth fallback");
+  check(model.estimate('A', {{2, 4}, {3, 1}}, 2) == 3, "Calibrated mixed likelihood");
+  check(model.estimate('A', {{2, 4}}, 2) == 2, "Low-depth model fallback");
+  check(model.estimate('C', {{2, 5}}, 2) == 2, "Unmodeled base fallback");
+  check(model.estimate('A', {{4, 5}}, 4) == 4, "Unmodeled true-length fallback");
+  for (const std::string &bad :
+       {"HPC_RUN_MODEL_V1 3 5\nA 2 1 .1 .2 .3 .4\n", "HPC_RUN_MODEL_V1 3 5\nA 1 1 0 .2 .3 .5\n",
+        "HPC_RUN_MODEL_V1 3 5\nA 1 1 .1 .2 .3 .5\n"}) {
+    bool invalid = false;
+    try {
+      std::istringstream input(bad);
+      RunModel::read(input);
+    } catch (const std::runtime_error &) {
+      invalid = true;
+    }
+    check(invalid, "Malformed run model rejected");
+  }
   // Exercise each free-overhang direction independently: swapping edlib query
   // and target must not invert insertion/deletion semantics in our read trace.
   auto left = align_boundary("TGCACGT", "ACGT", true, false, 0.15);
@@ -44,6 +69,10 @@ int main() {
   check(call({{}, {{5, 100}}}, 1).tier == 1, "Fallback");
   check(call({{{8, 1}}, {{5, 100}}}, 2).tier == 1, "Support threshold");
   check(call({{{4, 2}, {6, 2}}}, 1).length == 4, "Deterministic tie");
+  check(call({{{25, 12}, {26, 9}, {27, 4}, {24, 3}, {23, 1}, {29, 1}}}, 1, true).length == 26,
+        "Experimental rounded mean uses the full distribution");
+  check(call({{{8, 1}}, {{5, 100}}}, 1, true).length == 8,
+        "Experimental mean preserves tier precedence");
   auto insertion = align("ACGAT", "ACGT", 1);
   check(insertion == "===I=", "Edlib insertion orientation");
   auto deletion = align("ACGT", "ACGAT", 1);
@@ -54,6 +83,28 @@ int main() {
   a.end = 4;
   size_t nm = 0;
   check(md(a, "ACGT", nm) == "4" && nm == 1, "MD insertion");
+  // Crop inside a read, keeping an insertion at the left edge, but not at the
+  // right edge. Reference coordinates and query clips must remain independent.
+  Alignment cropped;
+  cropped.sequence = "ACGAT";
+  cropped.ops = "===I=";
+  cropped.end = 4;
+  check(crop_alignment(cropped, 3, 4) && cropped.begin == 0 && cropped.end == 1 &&
+            cropped.clip_left == 3 && cropped.clip_right == 0,
+        "Crop insertion at left boundary");
+  check(md(cropped, "T", nm) == "1" && nm == 1, "Cropped insertion NM/MD");
+  cropped = a;
+  check(crop_alignment(cropped, 0, 3) && cropped.clip_right == 2 && md(cropped, "ACG", nm) == "3" &&
+            nm == 0,
+        "Crop insertion at right boundary");
+  cropped.sequence = "ACT";
+  cropped.shared_sequence.reset();
+  cropped.ops = "==D=";
+  cropped.packed_ops = false;
+  cropped.begin = 0;
+  cropped.end = 4;
+  cropped.clip_left = cropped.clip_right = 0;
+  check(!crop_alignment(cropped, 2, 3), "Do not export deletion-only crop");
   // Six spanning reads give a high-confidence allele; alternate strands ensure
   // packing the trace does not accidentally change strand-support decisions.
   std::vector<Alignment> reads(6);

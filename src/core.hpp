@@ -2,6 +2,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <istream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,7 +51,24 @@ struct Call {
   int tier = -1;
 };
 using Histogram = std::map<uint32_t, uint32_t>;
-Call call(const std::vector<Histogram> &tiers, uint32_t min_support);
+// Rounded mean is an opt-in diagnostic estimator; mode remains the default.
+Call call(const std::vector<Histogram> &tiers, uint32_t min_support, bool rounded_mean = false);
+// Conditional run-length likelihoods. Each base has contiguous true-length
+// rows beginning at one; the last observed bin includes all longer observations.
+// Models are optional and never change tier eligibility or placement preference.
+class RunModel {
+public:
+  static RunModel read(std::istream &input);
+  uint32_t estimate(char base, const Histogram &observations, uint32_t fallback) const;
+  uint32_t estimate_single(char base, uint32_t observed, uint32_t depth) const;
+
+private:
+  size_t observed_max = 0;
+  uint32_t minimum_depth = 5;
+  std::map<char, std::vector<std::vector<double>>> log_probabilities;
+  // Single-allele predictions are independent of depth once the minimum is met.
+  std::map<char, std::vector<uint32_t>> single_allele_calls;
+};
 // Replace reference[begin:end] with alt. Empty intervals represent insertions.
 struct Edit {
   size_t begin = 0, end = 0;
@@ -74,6 +92,10 @@ struct Alignment {
     return shared_sequence ? *shared_sequence : sequence;
   }
 };
+// Intersect an alignment with reference[begin:end], rebase reference coordinates,
+// and soft-clip excluded query bases. Insertion at begin belongs to the crop;
+// insertion at end does not. Returns false if no query/reference overlap remains.
+bool crop_alignment(Alignment &a, size_t begin, size_t end);
 std::vector<Edit> events(const Alignment &a, const std::string &reference);
 struct Accepted {
   Edit edit;

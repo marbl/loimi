@@ -169,6 +169,28 @@ std::string align(const std::string &q, const std::string &r, double rate) {
   merylutil::edlibFreeAlignResult(result);
   return ops;
 }
+std::vector<uint8_t> local_hpc_votes(const std::string &ops, size_t radius, double max_error) {
+  if (radius == 0 || !std::isfinite(max_error) || max_error < 0 || max_error > 1)
+    throw std::runtime_error("Invalid local HPC filter parameters");
+  if (ops.find_first_not_of("=XID") != std::string::npos)
+    throw std::runtime_error("Invalid expanded HPC trace");
+  if (ops.find_first_not_of('=') == std::string::npos)
+    return {};
+  // A rolling sum avoids a per-base integer prefix array. The caller releases
+  // this temporary mask after voting for one read, never retaining it per tig.
+  std::vector<uint8_t> mask(ops.size());
+  size_t left = 0, right = 0, errors = 0;
+  for (size_t i = 0; i < ops.size(); ++i) {
+    size_t begin = i > radius ? i - radius : 0;
+    size_t end = i + std::min(radius, ops.size() - i - 1) + 1;
+    while (right < end)
+      errors += ops[right++] != '=';
+    while (left < begin)
+      errors -= ops[left++] != '=';
+    mask[i] = ops[i] == '=' && double(errors) <= max_error * double(end - begin);
+  }
+  return mask;
+}
 std::string cigar(const std::string &ops) {
   std::string out;
   for (size_t i = 0; i < ops.size();) {

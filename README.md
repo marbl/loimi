@@ -435,3 +435,38 @@ The chromosome-sized user dataset has not been benchmarked locally. E. coli
 polish+CRAM before/after measurements and sequence-equivalence checks are recorded
 in `../ecoli-test/memory-results.txt`; small-test savings do not guarantee the
 same ratio at chromosome scale.
+
+## Local HPC vote filtering
+
+Run-length voting now rejects locally poor parts of otherwise acceptable HPC
+alignments. By default, each matching operation must have at most 15% X/I/D
+operations in a centered window of radius 500 (up to 1,001 HPC alignment
+operations). Terminal windows are truncated, and insertions count in both the
+error numerator and operation denominator. This is separate from `--max-error`,
+which controls whole-read alignment acceptance.
+
+Use `--hpc-filter-radius N` and `--hpc-filter-error F` to adjust the gate, or
+`--no-hpc-filter` to reproduce the prior voting behavior. These settings apply
+to all tiers; they do not change priority, multiplicity, model parameters, or
+mode tie breaking. The filter is not the experimental ambiguous-read pooling
+policy. Singleton pass-through remains unchanged.
+
+Rejected positions contribute neither consensus votes nor diagnostic evidence
+histograms. Summary fields `filtered_hpc_votes` and `locally_filtered_reads`
+count rejected otherwise-eligible matching operations and affected read
+placements. If every vote is rejected, the existing lower-tier fallback and
+missing-evidence policy apply. Reads remain available for optional raw alignment,
+polishing and CRAM export; the filter does not clip or remove CRAM records.
+
+The rolling calculation is linear in trace length and uses one temporary byte
+per operation for one read during voting, not chromosome-wide per-read masks.
+Exact traces skip allocation. Clean portions of damaged reads remain eligible.
+This addresses locally non-collinear tails that pass the whole-read cutoff;
+the defaults are not a guarantee of optimal filtering for every technology.
+
+In the HG002 35-Mb diagnostic fixture, filtering reduced the flanked hotspot
+from 4,182 incorrect runs (6,424 differing bases) to two runs (three bases),
+with no changed run lengths elsewhere in the ~11-Mb fixture. The remaining
+errors include an existing long-run disagreement and a terminal-read tie
+exposed by removing bad evidence. This is a regional validation, not a new
+whole-chromosome QV measurement or cross-technology benchmark.

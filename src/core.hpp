@@ -23,6 +23,11 @@ std::string reverse_complement(std::string s);
 // Global unit-cost alignment, capped at ceil(max_error * max(sequence lengths)).
 // Throws on failed alignment. Returned traces are expanded, not CIGAR strings.
 std::string align(const std::string &query, const std::string &reference, double max_error);
+// Centered local-quality gate in expanded HPC alignment-operation space.
+// X/I/D all count as errors. Terminal windows are truncated to the trace.
+// Empty means every matching operation is eligible (including exact traces).
+// Otherwise one byte per operation: only locally acceptable '=' positions vote.
+std::vector<uint8_t> local_hpc_votes(const std::string &ops, size_t radius, double max_error);
 // Persist compact traces; expand only for the current read. Internal packed
 // traces contain =/X/I/D, not soft clips or arbitrary externally supplied SAM.
 std::string cigar(const std::string &ops);

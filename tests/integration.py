@@ -49,6 +49,51 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
     run(base + ["--output", root / "fast"])
     assert sequence(root / "fast.fasta") == "AAAAACCGTTT"
     assert (root / "fast.fasta").read_text().startswith(">tig00000001\n")
+    run(base + ["--no-hpc-filter", "--output", root / "unfiltered-exact"])
+    assert sequence(root / "unfiltered-exact.fasta") == sequence(root / "fast.fasta")
+    assert json.loads((root / "fast.summary.json").read_text())["filtered_hpc_votes"] == 0
+    for flag, value in [("--hpc-filter-radius", "0"), ("--hpc-filter-error", "1.1")]:
+        run(base + [flag, value, "--output", root / "invalid-filter"], ok=False)
+    # A long accurate prefix lets a non-collinear tail pass the whole-read
+    # cutoff. Its isolated '=' operations must not contaminate run lengths.
+    rng_filter = random.Random(139)
+    def random_hpc(length, previous=""):
+        bases = []
+        for _ in range(length):
+            previous = rng_filter.choice([b for b in "ACGT" if b != previous])
+            bases.append(previous)
+        return "".join(bases)
+    target = random_hpc(10000)
+    corrupt = target[:9000] + random_hpc(1000, target[8999])
+    double = lambda s: "".join(b * 2 for b in s)
+    local_reads = [(f"anchor{i}", double(target[:1500])) for i in range(6)]
+    local_reads += [("good", double(target)), ("bad", double(corrupt[:9000]) + corrupt[9000:])]
+    (root / "local.fa").write_text("".join(f">{n}\n{s}\n" for n,s in local_reads))
+    local_rows = [f"local_{n}\t0\t{1500 if n.startswith('anchor') else 10000}\t1" for n,s in local_reads]
+    (root / "local.layout").write_text("tig\tlocal\nlen\t10000\nrds\t8\n" + "\n".join(local_rows) + "\nend\n")
+    (root / "local.template.fa").write_text(">1\n" + target + "\n")
+    run([tools / "sqStoreCreate", "-o", root / "local.seqStore", "-minlength", "1", "-raw", "-pacbio", "local", root / "local.fa"])
+    run([tools / "layoutToPackage", "-layout", root / "local.layout", "-store", root / "local.seqStore", "-output", root / "local#.cnspack", "-idmap", root / "local.maps"])
+    local_base = [exe, "--import", next(root.glob("local*.cnspack")), "--template-hpc", root / "local.template.fa", "--tier", "reads=*", "--threads", "2"]
+    (root / "local.sites").write_text("tig00000001\t9500\n")
+    run(local_base + ["--evidence-sites", root / "local.sites", "--output", root / "local-filtered"])
+    run(local_base + ["--no-hpc-filter", "--output", root / "local-unfiltered"])
+    def bad_lengths(prefix):
+        rows = (root / (prefix + ".run-calls.tsv")).read_text().splitlines()[1:]
+        return sum(int(row.split("\t")[5]) != 2 for row in rows)
+    assert bad_lengths("local-unfiltered") > 100
+    assert bad_lengths("local-filtered") < bad_lengths("local-unfiltered") / 4
+    metrics = json.loads((root / "local-filtered.summary.json").read_text())
+    assert metrics["filtered_hpc_votes"] > 100 and metrics["locally_filtered_reads"] == 1
+    local_evidence = (root / "local-filtered.run-evidence.tsv").read_text().splitlines()[1:]
+    assert len(local_evidence) == 1 and local_evidence[0].split("\t")[5:] == ["2", "1"]
+    assert sequence(root / "local-filtered.fasta").startswith(double(target[:8500]))
+    if shutil.which("samtools"):
+        run(local_base + ["--output", root / "local-cram", "--cram", root / "local.cram"])
+        assert sequence(root / "local-cram.fasta") == sequence(root / "local-filtered.fasta")
+        run(["samtools", "quickcheck", root / "local.cram"])
+        records_out = run(["samtools", "view", root / "local.cram"]).stdout.splitlines()
+        assert any(row.split("\t")[0] == "local_bad" for row in records_out)
     # Calibration exports every tier before priority selection, but only at
     # requested HPC indexes. Read exclusions must not alter the called FASTA.
     (root / "sites.tsv").write_text("tig00000001\t0\n")

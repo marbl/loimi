@@ -1,6 +1,6 @@
 # Design status and implementation guide
 
-Updated: 2026-10-09
+Updated: 2026-10-13
 
 This file includes the original 2026-10-02 proposal below for rationale and
 research context. It is historical: where it conflicts with this status section,
@@ -9,6 +9,12 @@ behavior. Proposed options and guarantees below are not automatically supported.
 
 ## Current implementation versus original proposal
 
+- Local HPC vote filtering is enabled by default: centered radius 500 operations,
+  maximum X/I/D fraction 0.15. It preserves clean portions of reads and gates
+  diagnostic histograms identically to consensus votes. It does not alter read
+  placements, raw-alignment eligibility, or CRAM export. CLI controls and memory
+  behavior are documented in README. Ambiguous-read pooling remains experimental
+  and is not implemented by this filter.
 - Optional `--tier-model LABEL=FILE` associates calibrated conditional run-length
   likelihoods with each technology tier. Mode remains the default/fallback;
   models do not change tier eligibility. Sampled all-tier HPC evidence export

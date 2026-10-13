@@ -35,6 +35,9 @@ struct Options {
   unsigned threads = 1, min_support = 1, polish_support = 5;
   size_t batch_bases = 8000000;
   double max_error = 0.15, polish_fraction = 0.9;
+  double local_hpc_error = 0.15;
+  size_t local_hpc_radius = 500;
+  bool filter_hpc = true;
   size_t max_indel = 500;
   bool polish = false, drop_unmatched = false, missing_error = false;
   bool experiment_mean = false, ambiguous_fallback = true;
@@ -110,6 +113,9 @@ static Options parse(int argc, char **argv) {
              "--tier-model LABEL=FILE  Optional calibrated run-length model for one tier\n"
              "--unmatched error|drop (default error)\n--min-run-support N (default 1)\n"
              "--missing-run one|error (default one)\n--max-error F (default 0.15)\n"
+             "--hpc-filter-radius N  Local vote window radius in HPC operations (default 500)\n"
+             "--hpc-filter-error F   Maximum local X/I/D fraction (default 0.15)\n"
+             "--no-hpc-filter        Disable local vote filtering for comparisons\n"
              "--threads N (default 1; parallel alignments within each tig)\n"
              "--batch-bases N (default 8000000; raw bases per HPC alignment batch)\n"
              "--polish-non-hpc      Optional conservative correction\n"
@@ -161,6 +167,12 @@ static Options parse(int argc, char **argv) {
       o.polish_support = number(value());
     else if (a == "--max-polish-indel")
       o.max_indel = number(value());
+    else if (a == "--hpc-filter-radius")
+      o.local_hpc_radius = number(value());
+    else if (a == "--hpc-filter-error")
+      o.local_hpc_error = probability(value());
+    else if (a == "--no-hpc-filter")
+      o.filter_hpc = false;
     else if (a == "--max-error")
       o.max_error = probability(value());
     else if (a == "--min-polish-fraction")
@@ -569,7 +581,7 @@ int main(int argc, char **argv) {
     }
     uint64_t tigs = 0, read_count = 0, used = 0, dropped = 0, no_evidence = 0, n_edits = 0,
              n_cram = 0, exact = 0, base_alignments = 0, ambiguous_run_calls = 0,
-             model_changed_runs = 0;
+             model_changed_runs = 0, filtered_hpc_votes = 0, locally_filtered_reads = 0;
     std::set<uint32_t> tig_ids, emitted_ids;
     std::map<uint32_t, unsigned> occurrences, declared;
     sqRead_setDefaultVersion(sqRead_raw | sqRead_normal);
@@ -922,7 +934,11 @@ int main(int argc, char **argv) {
             ++used;
             if (w.rle.bases == ref.substr(w.hbegin, w.hend - w.hbegin))
               ++exact;
-            size_t q = 0, r = w.hbegin;
+            auto local_votes = o.filter_hpc
+                                   ? local_hpc_votes(w.trace, o.local_hpc_radius, o.local_hpc_error)
+                                   : std::vector<uint8_t>{};
+            size_t q = 0, r = w.hbegin, operation = 0;
+            bool filtered_read = false;
             for (char op : w.trace) {
               // Original raw clipping may cut a run. Do not vote with a truncated length.
               bool partial = (q == 0 && w.a.clip_left > 0 &&
@@ -931,8 +947,13 @@ int main(int argc, char **argv) {
                               w.a.bases()[w.a.bases().size() - w.a.clip_right - 1] ==
                                   w.a.bases()[w.a.bases().size() - w.a.clip_right]);
               if (op == '=' && ref[r] != 'N' && !partial) {
+                bool eligible = local_votes.empty() || local_votes[operation];
+                if (!eligible) {
+                  ++filtered_hpc_votes;
+                  filtered_read = true;
+                }
                 auto len = w.rle.lengths[q];
-                {
+                if (eligible) {
                   int vote_tier = w.a.tier + (w.unique ? 0 : int(o.tiers.size()));
                   if (!evidence_mask.empty() && evidence_mask[r] &&
                       !evidence_excluded.count(w.a.id))
@@ -954,7 +975,9 @@ int main(int argc, char **argv) {
                 ++q;
               if (op != 'I')
                 ++r;
+              ++operation;
             }
+            locally_filtered_reads += filtered_read;
           }
           w.rle = {};
           // clear() alone retains string capacity; swap releases no-longer-needed
@@ -1226,6 +1249,8 @@ int main(int argc, char **argv) {
                              << ",\n  \"no_evidence_runs\": " << no_evidence
                              << ",\n  \"ambiguous_run_calls\": " << ambiguous_run_calls
                              << ",\n  \"model_changed_runs\": " << model_changed_runs
+                             << ",\n  \"filtered_hpc_votes\": " << filtered_hpc_votes
+                             << ",\n  \"locally_filtered_reads\": " << locally_filtered_reads
                              << ",\n  \"non_hpc_edits\": " << n_edits
                              << ",\n  \"base_alignments\": " << base_alignments
                              << ",\n  \"cram_records\": " << n_cram << "\n}\n";

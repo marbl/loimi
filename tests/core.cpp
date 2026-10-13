@@ -12,6 +12,31 @@ static void check(bool v, const char *msg) {
     throw std::runtime_error(msg);
 }
 int main() {
+  check(local_hpc_votes(std::string(2000, '='), 500, .15).empty(), "Exact trace fast path");
+  check(local_hpc_votes("", 500, .15).empty(), "Empty trace");
+  std::string damaged(2000, '=');
+  for (size_t i = 1400; i < damaged.size(); i += 3)
+    damaged[i] = "XID"[(i / 3) % 3];
+  auto local = local_hpc_votes(damaged, 100, .15);
+  check(local[500] && !local[1900], "Preserve clean prefix; reject damaged tail");
+  auto reversed = damaged;
+  std::reverse(reversed.begin(), reversed.end());
+  auto backward = local_hpc_votes(reversed, 100, .15);
+  std::reverse(backward.begin(), backward.end());
+  check(local == backward, "Local quality is orientation symmetric");
+  // Compare the rolling implementation with a direct count at every position,
+  // including short traces, insertions, deletions, and truncated terminal windows.
+  for (size_t radius : {1u, 7u, 5000u}) {
+    auto observed = local_hpc_votes(damaged, radius, .15);
+    for (size_t i = 0; i < damaged.size(); ++i) {
+      size_t b = i > radius ? i - radius : 0;
+      size_t e = i + std::min(radius, damaged.size() - i - 1) + 1;
+      auto errors =
+          std::count_if(damaged.begin() + b, damaged.begin() + e, [](char c) { return c != '='; });
+      check(bool(observed[i]) == (damaged[i] == '=' && errors <= .15 * (e - b)),
+            "Rolling local quality equals reference implementation");
+    }
+  }
   std::istringstream model_input("HPC_RUN_MODEL_V1 3 5\n"
                                  "A 1 100 .01 .96 .02 .01\n"
                                  "A 2 100 .01 .25 .4 .34\n"

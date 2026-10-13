@@ -199,6 +199,52 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
     assert sequence(root / "fallback-enabled.fasta") == "AAAAACCGTTTGGAACCTT"
     fallback_metrics = json.loads((root / "fallback-enabled.summary.json").read_text())
     assert fallback_metrics["no_evidence_runs"] == 0 and fallback_metrics["ambiguous_run_calls"] == 4
+    # Six prefix-only anchors establish offset independently of the tail's
+    # evidence. Tail tuples are (tier, unique count, ambiguous count, G length).
+    def check_tier_policy(label, tiers, expected, selected_tier, depth, placement, extra=()):
+        reads = [(f"anchor{i}", "ACGT", 4, 1) for i in range(6)]
+        for tier, unique, ambiguous, length in tiers:
+            for kind, count, copies in [("u", unique, 1), ("a", ambiguous, 2)]:
+                reads += [(f"{tier}{kind}{i}", "ACGT" + "G" * length + "ACT", 8, copies)
+                          for i in range(count)]
+        stem = root / label
+        stem.with_suffix(".fa").write_text("".join(f">{n}\n{s}\n" for n,s,_,_ in reads))
+        stem.with_suffix(".layout").write_text(f"tig\t{label}\nlen\t8\nrds\t{len(reads)}\n" +
+            "".join(f"{label}_{n}\t0\t{end}\t{copies}\n" for n,s,end,copies in reads) + "end\n")
+        run([tools / "sqStoreCreate", "-o", str(stem) + ".store", "-minlength", "1", "-raw", "-pacbio", label, stem.with_suffix(".fa")])
+        run([tools / "layoutToPackage", "-layout", stem.with_suffix(".layout"), "-store", str(stem) + ".store", "-output", str(stem) + "#.tierpack"])
+        args = [exe, "--import", next(root.glob(label + "*.tierpack")), "--template-hpc", root / "fallback.template.fa"]
+        for tier in ("LA", "LAO", "UL"):
+            # Explicit separator avoids LA matching LAO names.
+            args += ["--tier", f"{tier}={label}_{tier}[ua]*"]
+        args += ["--tier", "anchors=*", *extra]
+        for suffix, batch, threads in [("small", "1", "1"), ("large", "8000000", "2")]:
+            output = str(stem) + "-" + suffix
+            run(args + ["--output", output, "--batch-bases", batch, "--threads", threads])
+            assert sequence(pathlib.Path(output + ".fasta")) == "ACGT" + "G" * expected + "ACT"
+            row = pathlib.Path(output + ".run-calls.tsv").read_text().splitlines()[5].split("\t")
+            assert row[6:8] == [selected_tier, str(depth)], row
+            assert row[-1] == placement, row
+        assert pathlib.Path(str(stem) + "-small.run-calls.tsv").read_bytes() == pathlib.Path(str(stem) + "-large.run-calls.tsv").read_bytes()
+    check_tier_policy("unique-next", [("LA",4,6,2),("LAO",5,0,3)], 3,"LAO",5,"UNIQUE")
+    check_tier_policy("unique-third", [("LA",2,8,2),("LAO",4,0,3),("UL",5,0,4)], 4,"UL",5,"UNIQUE")
+    check_tier_policy("pooled-first", [("LA",2,3,2),("LAO",4,4,3)], 2,"LA",5,"POOLED")
+    check_tier_policy("pooled-next", [("LA",2,2,2),("LAO",3,2,3)], 3,"LAO",5,"POOLED")
+    check_tier_policy("sparse-first", [("LA",1,1,2),("LAO",2,2,3)], 2,"LA",2,"POOLED")
+    check_tier_policy("unique-sparse", [("LA",1,5,2),("LAO",4,4,3)], 2,"LA",1,"UNIQUE", ["--unique-only"])
+    check_tier_policy("unique-only-next", [("LA",4,5,2),("LAO",5,4,3)], 3,"LAO",5,"UNIQUE", ["--unique-only"])
+    # Calibration sees combined depth five, not two separate subthreshold
+    # histograms, and uses the winning tier's model only.
+    pooled_rows = ["HPC_RUN_MODEL_V1 20 5"]
+    for length in range(1, 7):
+        weights = [1.0] * 21
+        weights[5 if length == 6 else (4 if length == 5 else length)] = 100.0
+        pooled_rows.append(f"G {length} 100 " + " ".join(str(x/sum(weights)) for x in weights))
+    (root / "pooled.model").write_text("\n".join(pooled_rows) + "\n")
+    check_tier_policy("pooled-model", [("LA",2,3,5),("LAO",4,0,3)], 6,"LA",5,"POOLED",
+                      ["--tier-model", f"LA={root / 'pooled.model'}"])
+    check_tier_policy("model-lower-unique", [("LA",2,3,5),("LAO",5,0,3)], 3,"LAO",5,"UNIQUE",
+                      ["--tier-model", f"LA={root / 'pooled.model'}"])
     # Polishing uses the same unique-first groups, without leaking temporary
     # group ranks into exported read-group labels.
     pol_reads = [(f"u{i}", "ACGT", 4, 1) for i in range(6)] + [(f"a{i}", "ACGTGAGT", 8, 2) for i in range(6)]

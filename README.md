@@ -179,11 +179,15 @@ Polishing leaves singleton sequences unchanged. No offset is inferred (reported
 as `.`), and run-call coordinates describe the passthrough sequence.
 
 Placements with packaged placement count exactly one and no distinct alternative
-in the input package are unique. Consensus searches all unique tiers first, then
-all known non-unique tiers in the same user-specified order. Thus unique UL beats
-non-unique LA, but non-unique LA can fill regions with no usable unique evidence.
-This applies to run calling and optional non-HPC polishing, using their respective
-support thresholds. `--unique-only` restores the original strict filtering for
+in the input package are unique. Run calling searches all unique tiers first,
+requiring at least five observations by default. If none qualifies, it searches
+the tiers again, pooling unique and known ambiguous observations **within each
+tier**, never across technologies. Thus qualifying unique UL beats pooled LA.
+If no pooled tier qualifies, the first tier with any evidence supplies a sparse
+fallback. `--unique-only` excludes ambiguous votes, retaining the same qualifying-
+then-sparse selection among unique tiers. Optional non-HPC polishing retains its
+separate unique-then-ambiguous groups and polishing thresholds; its policy is not
+changed by the run-calling threshold. `--unique-only` also filters polishing for
 controlled comparisons; `--ambiguous-fallback` explicitly selects the default.
 Unknown placement counts (zero) remain export-only. Offset discovery still needs
 unique anchors; entirely ambiguous multi-read tigs are not yet supported.
@@ -197,8 +201,11 @@ within a tig) are deduplicated. A package prepass counts distinct occurrences.
 Uniqueness is trusted from the layout, not independently inferred by mapping.
 
 For each template run, only matching aligned read bases contribute a run length.
-The first tier with at least `--min-run-support` observations wins; lower tiers
-cannot outvote it. The called length is the empirical histogram mode. Tied modes
+The first qualifying tier in the search above wins; lower tiers cannot outvote
+it. `--min-run-support` is a preference threshold, not a hard evidence discard:
+sparse fallback prevents covered runs becoming unsupported. Setting it to one
+restores preference for even one unique observation. The called length is the
+empirical histogram mode. Tied modes
 are resolved by minimum total absolute distance to observations, then smaller
 length. This is not a fitted or smoothed distribution model. Quality priority is
 entirely user-specified by tiers, not per-base quality scores.
@@ -206,8 +213,10 @@ entirely user-specified by tiers, not per-base quality scores.
 `--experiment-run-mean` instead rounds the empirical mean of the selected
 distribution. This is an experimental diagnostic, not a validated accuracy
 improvement; the modal caller remains the default. `.run-calls.tsv` reports
-`placement_class` as UNIQUE, AMBIGUOUS or NONE, and summary JSON counts
-`ambiguous_run_calls` separately. The `peak` column is still the histogram's
+`placement_class` as UNIQUE, AMBIGUOUS, POOLED (both placement classes), or NONE.
+Summary JSON counts `ambiguous_run_calls`, including POOLED calls. Depth and
+peak refer to the selected histogram, including both classes when pooled.
+The `peak` column is still the histogram's
 modal count, including when the experimental mean is used.
 
 For native regional fixtures, the build also includes `extract-regions`:
@@ -241,7 +250,7 @@ There is one correction pass, not iterative polishing.
 | --- | --- | --- |
 | `--threads N` | 1 | Parallel per-read alignment work within a tig; also passed to samtools |
 | `--batch-bases N` | 8000000 | Approximate raw-base budget for each HPC alignment batch; a single read may exceed it |
-| `--min-run-support N` | 1 | Minimum total observations for a tier to call a run |
+| `--min-run-support N` | 5 | Preferred tier depth; retain sparse evidence if none qualifies |
 | `--missing-run one\|error` | one | Policy when no tier qualifies |
 | `--unmatched error\|drop` | error | Policy for eligible reads matching no tier |
 | `--max-error F` | 0.15 | Unit edit-distance cap, rounded up, relative to the longer sequence |
@@ -418,11 +427,16 @@ arrays and expanded traces are discarded immediately after evidence accumulation
 Only compact CIGAR traces survive to later stages. Raw trace construction
 re-encodes one read per worker, but does not repeat its HPC alignment.
 
-Run histograms use a 12-byte inline bin plus sparse overflow for alternative
-lengths. At default support, only the winning tier is retained; with
-`--min-run-support > 1`, bins are allocated for every specified tier so fallback
-remains exact. For 170 million runs, inline storage is about 2.04 GB per retained
-tier, plus sparse overflow. The raw-coordinate prefix vector adds about 1.36 GB.
+Run calling processes one tier/placement class at a time without reordering CRAM
+records. Dense accumulation uses an 8-byte bin, a 16-byte selected call and two
+one-byte flags per run, independent of tier count: about 4.42 GB for 170 million
+runs, plus sparse overflow. Below-threshold unique histograms are retained for
+later same-tier pooling as 16-byte records per distinct observed length. This
+storage is data-dependent and can be substantial: with threshold five, at most
+four records per run per tier are needed, plus vector spare capacity. Raising
+the threshold increases this bound. This is not a process memory cap.
+Accumulators and pending evidence are released before allocating the
+raw-coordinate prefix vector (about 1.36 GB for 170 million runs).
 Decoded reads and polishing candidates remain data-dependent memory costs.
 
 Polishing references existing sequences/compact traces instead of copying them.

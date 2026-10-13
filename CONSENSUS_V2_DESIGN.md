@@ -13,16 +13,24 @@ behavior. Proposed options and guarantees below are not automatically supported.
   maximum X/I/D fraction 0.15. It preserves clean portions of reads and gates
   diagnostic histograms identically to consensus votes. It does not alter read
   placements, raw-alignment eligibility, or CRAM export. CLI controls and memory
-  behavior are documented in README. Ambiguous-read pooling remains experimental
-  and is not implemented by this filter.
+  behavior are documented in README. This filter is independent of the
+  tier selection and same-tier pooling described below.
 - Optional `--tier-model LABEL=FILE` associates calibrated conditional run-length
   likelihoods with each technology tier. Mode remains the default/fallback;
   models do not change tier eligibility. Sampled all-tier HPC evidence export
   supports separate training and held-out validation. Model formats and limits
   are documented in README; models are not universal chemistry defaults.
-- Consensus now prefers all unique tiers before falling back through non-unique
-  tiers, rather than leaving ambiguous-only regions at run length one.
-  `--unique-only` retains the old policy for comparisons. Offset inference still
+- Run calling tries unique tiers in order at depth >=5 by default. Only if none
+  qualifies does it try pooled unique+ambiguous evidence within each tier, in
+  order. If none qualifies, the highest-priority tier with any evidence supplies
+  a sparse fallback. Technologies are never pooled together. `--unique-only`
+  limits both qualifying and sparse selection to unique observations. The
+  threshold is configurable with `--min-run-support`; models receive the chosen
+  histogram without changing their own minimum-depth requirements.
+  One dense current-phase accumulator avoids a dense runs-times-tiers allocation;
+  sparse below-threshold unique histograms survive for pooling. These still have
+  data-dependent memory costs (see README). Full-chromosome peak RSS and accuracy
+  with this policy have not been measured locally. Offset inference still
   requires unique anchors. The run-length mode remains the default; a rounded
   mean option is explicitly experimental and not a validated replacement.
 - Regional iteration supports one `--region tigID:BEGIN-END` in uncompressed
@@ -44,7 +52,8 @@ behavior. Proposed options and guarantees below are not automatically supported.
 - Boundary-crossing reads are retained with semi-global HPC overlap alignment
   and raw soft clips. Partially clipped runs cannot donate truncated lengths.
 - The legacy `skipConsensus` flag is ignored. Explicit ordered wildcard tiers
-  determine priority; all unique tiers precede the non-unique fallback group.
+  determine priority. Non-HPC polishing retains separate unique-then-ambiguous
+  groups and its own thresholds; the run-calling pooling change does not alter it.
 - Distinct repeated placements are allowed in CRAM. The first successfully
   emitted occurrence is primary; later ones are secondary with equal
   multiplicity-adjusted MAPQ. This supersedes the original single-record policy.

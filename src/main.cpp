@@ -32,7 +32,7 @@ struct Options {
   std::string evidence_sites, evidence_exclude_reads;
   std::map<std::string, std::string> model_paths;
   std::vector<Tier> tiers;
-  unsigned threads = 1, min_support = 1, polish_support = 5;
+  unsigned threads = 1, min_support = 5, polish_support = 5;
   size_t batch_bases = 8000000;
   double max_error = 0.15, polish_fraction = 0.9;
   double local_hpc_error = 0.15;
@@ -108,10 +108,11 @@ static Options parse(int argc, char **argv) {
              "--evidence-sites FILE  Export all-tier HPC histograms at TIG RUN rows (zero-based)\n"
              "--evidence-exclude-reads FILE  Read IDs excluded only from diagnostic histograms\n"
              "--unique-only        Disable default fallback to multiply placed reads\n"
-             "--ambiguous-fallback Use non-unique tiers after all unique tiers (default)\n"
+             "--ambiguous-fallback Pool within tiers if no unique tier qualifies (default)\n"
              "--tier [LABEL=]GLOB   Repeated in priority order; first matching glob wins\n"
              "--tier-model LABEL=FILE  Optional calibrated run-length model for one tier\n"
-             "--unmatched error|drop (default error)\n--min-run-support N (default 1)\n"
+             "--unmatched error|drop (default error)\n--min-run-support N (default 5)\n"
+             "Try unique tiers, then pooled tiers; sparse evidence is retained as last resort.\n"
              "--missing-run one|error (default one)\n--max-error F (default 0.15)\n"
              "--hpc-filter-radius N  Local vote window radius in HPC operations (default 500)\n"
              "--hpc-filter-error F   Maximum local X/I/D fraction (default 0.15)\n"
@@ -870,18 +871,39 @@ int main(int argc, char **argv) {
       // Histograms persist; per-read RLE and expanded traces exist only inside a bounded batch.
       struct RunBin {
         uint32_t length = 0, count = 0;
-        int tier = -1;
       };
-      // One inline allele handles the common case. Alternative lengths use
-      // sparse overflow. Higher support thresholds must retain every tier until
-      // its total depth is known, otherwise fallback would depend on read order.
-      // Fallback is a SECOND ordered group, after every unique
-      // tier. It never allows an ambiguous high tier to displace unique evidence.
-      size_t histogram_tiers =
-          o.min_support == 1 ? 1 : o.tiers.size() * (o.ambiguous_fallback ? 2 : 1);
-      require(ref.size() <= SIZE_MAX / histogram_tiers, "Histogram allocation overflow");
-      std::vector<RunBin> bins(ref.size() * histogram_tiers);
+      // Process unique tiers before pooled tiers without multiplying dense
+      // chromosome storage by tier count. Below-threshold unique observations
+      // survive sparsely until their same-tier ambiguous observations arrive.
+      // Only the processing index changes: work remains in original order for
+      // placement bookkeeping, primary/secondary assignment and CRAM output.
+      const size_t nt = o.tiers.size();
+      std::vector<std::vector<size_t>> groups(2 * nt);
+      for (size_t i = 0; i < work.size(); ++i)
+        groups[(work[i].unique ? 0 : nt) + std::max(0, work[i].a.tier)].push_back(i);
+      std::vector<RunBin> bins(ref.size());
+      std::vector<uint8_t> vote_classes(ref.size()); // 1 unique, 2 ambiguous
       std::map<size_t, Histogram> overflow;
+      struct SparseVote {
+        size_t run;
+        uint32_t length, count;
+      };
+      std::vector<std::vector<SparseVote>> pending(nt);
+      std::vector<Call> selected(ref.size());
+      // Bits: 1 threshold-qualified/final, 2 model changed length, 4 pooled.
+      std::vector<uint8_t> selected_flags(ref.size());
+      auto add_vote = [&](size_t run, uint32_t length, uint32_t count, uint8_t kind) {
+        if (selected_flags[run] & 1)
+          return;
+        auto &bin = bins[run];
+        vote_classes[run] |= kind;
+        if (!bin.count)
+          bin = {length, count};
+        else if (bin.length == length)
+          bin.count += count;
+        else
+          overflow[run][length] += count;
+      };
       std::vector<uint8_t> evidence_mask;
       std::map<std::pair<size_t, int>, Histogram> evidence;
       auto selected_sites = evidence_sites.find(name);
@@ -893,105 +915,148 @@ int main(int argc, char **argv) {
         }
       }
       memory_stage("starting batched HPC alignment");
-      for (size_t batch = 0; batch < work.size();) {
-        // This bounds scratch, not total RSS. Always admit one read even if it
-        // exceeds the base budget; also cap placement count for tiny/filtered reads.
-        size_t end = batch, bases = 0;
-        do {
-          bases += work[end].a.bases().size();
-          ++end;
-        } while (end < work.size() && end - batch < 4096 && bases < o.batch_bases);
-        parallel(end - batch, o.threads, [&](size_t j) {
-          size_t i = batch + j;
-          auto &w = work[i];
-          if (!w.reason.empty())
-            return;
-          try {
-            auto seq = w.a.bases().substr(w.a.clip_left,
-                                          w.a.bases().size() - w.a.clip_left - w.a.clip_right);
-            w.rle = encode(seq);
-            auto target = ref.substr(w.hbegin, w.hend - w.hbegin);
-            if (w.boundary_left || w.boundary_right) {
-              auto a = align_boundary(w.rle.bases, target, w.boundary_left, w.boundary_right,
-                                      o.max_error);
-              size_t b = w.rle.offsets.at(a.query_begin), e = w.rle.offsets.at(a.query_end);
-              // Convert aligned run bounds to raw bases before dropping the RLE
-              // scratch. Existing raw clips are additive and retain SAM orientation.
-              require(e > b, "Empty boundary overlap");
-              w.a.clip_left += b;
-              w.a.clip_right += seq.size() - e;
-              w.rle = encode(seq.substr(b, e - b));
-              w.trace = std::move(a.ops);
-            } else
-              w.trace = align(w.rle.bases, target, o.max_error);
-          } catch (const std::exception &e) {
-            w.reason = "HPC_ALIGNMENT_FAILED";
-          }
-        });
-        for (size_t i = batch; i < end; ++i) {
-          auto &w = work[i];
-          if (w.reason.empty() && (w.unique || (o.ambiguous_fallback && w.placements > 1))) {
-            ++used;
-            if (w.rle.bases == ref.substr(w.hbegin, w.hend - w.hbegin))
-              ++exact;
-            auto local_votes = o.filter_hpc
-                                   ? local_hpc_votes(w.trace, o.local_hpc_radius, o.local_hpc_error)
-                                   : std::vector<uint8_t>{};
-            size_t q = 0, r = w.hbegin, operation = 0;
-            bool filtered_read = false;
-            for (char op : w.trace) {
-              // Original raw clipping may cut a run. Do not vote with a truncated length.
-              bool partial = (q == 0 && w.a.clip_left > 0 &&
-                              w.a.bases()[w.a.clip_left - 1] == w.a.bases()[w.a.clip_left]) ||
-                             (q + 1 == w.rle.bases.size() && w.a.clip_right > 0 &&
-                              w.a.bases()[w.a.bases().size() - w.a.clip_right - 1] ==
-                                  w.a.bases()[w.a.bases().size() - w.a.clip_right]);
-              if (op == '=' && ref[r] != 'N' && !partial) {
-                bool eligible = local_votes.empty() || local_votes[operation];
-                if (!eligible) {
-                  ++filtered_hpc_votes;
-                  filtered_read = true;
-                }
-                auto len = w.rle.lengths[q];
-                if (eligible) {
-                  int vote_tier = w.a.tier + (w.unique ? 0 : int(o.tiers.size()));
-                  if (!evidence_mask.empty() && evidence_mask[r] &&
-                      !evidence_excluded.count(w.a.id))
-                    ++evidence[{r, vote_tier}][len];
-                  size_t key = r * histogram_tiers + (o.min_support == 1 ? 0 : vote_tier);
-                  auto &bin = bins[key];
-                  if (bin.tier < 0 || vote_tier < bin.tier) {
-                    bin = {len, 1, vote_tier};
-                    overflow.erase(key);
-                  } else if (vote_tier == bin.tier) {
-                    if (len == bin.length)
-                      ++bin.count;
-                    else
-                      ++overflow[key][len];
+      for (size_t phase = 0; phase < groups.size(); ++phase) {
+        bool pooled_phase = phase >= nt;
+        size_t tier = phase % nt;
+        if (pooled_phase && o.ambiguous_fallback) {
+          for (const auto &vote : pending[tier])
+            add_vote(vote.run, vote.length, vote.count, 1);
+          std::vector<SparseVote>().swap(pending[tier]);
+        }
+        const auto &order = groups[phase];
+        for (size_t batch = 0; batch < order.size();) {
+          // This bounds scratch, not total RSS. Always admit one read even if it
+          // exceeds the base budget; also cap placement count for tiny/filtered reads.
+          size_t end = batch, bases = 0;
+          do {
+            bases += work[order[end]].a.bases().size();
+            ++end;
+          } while (end < order.size() && end - batch < 4096 && bases < o.batch_bases);
+          parallel(end - batch, o.threads, [&](size_t j) {
+            size_t i = order[batch + j];
+            auto &w = work[i];
+            if (!w.reason.empty())
+              return;
+            try {
+              auto seq = w.a.bases().substr(w.a.clip_left,
+                                            w.a.bases().size() - w.a.clip_left - w.a.clip_right);
+              w.rle = encode(seq);
+              auto target = ref.substr(w.hbegin, w.hend - w.hbegin);
+              if (w.boundary_left || w.boundary_right) {
+                auto a = align_boundary(w.rle.bases, target, w.boundary_left, w.boundary_right,
+                                        o.max_error);
+                size_t b = w.rle.offsets.at(a.query_begin), e = w.rle.offsets.at(a.query_end);
+                // Convert aligned run bounds to raw bases before dropping the RLE
+                // scratch. Existing raw clips are additive and retain SAM orientation.
+                require(e > b, "Empty boundary overlap");
+                w.a.clip_left += b;
+                w.a.clip_right += seq.size() - e;
+                w.rle = encode(seq.substr(b, e - b));
+                w.trace = std::move(a.ops);
+              } else
+                w.trace = align(w.rle.bases, target, o.max_error);
+            } catch (const std::exception &e) {
+              w.reason = "HPC_ALIGNMENT_FAILED";
+            }
+          });
+          for (size_t i = batch; i < end; ++i) {
+            auto &w = work[order[i]];
+            if (w.reason.empty() && (w.unique || (o.ambiguous_fallback && w.placements > 1))) {
+              ++used;
+              if (w.rle.bases == ref.substr(w.hbegin, w.hend - w.hbegin))
+                ++exact;
+              auto local_votes =
+                  o.filter_hpc ? local_hpc_votes(w.trace, o.local_hpc_radius, o.local_hpc_error)
+                               : std::vector<uint8_t>{};
+              size_t q = 0, r = w.hbegin, operation = 0;
+              bool filtered_read = false;
+              for (char op : w.trace) {
+                // Original raw clipping may cut a run. Do not vote with a truncated length.
+                bool partial = (q == 0 && w.a.clip_left > 0 &&
+                                w.a.bases()[w.a.clip_left - 1] == w.a.bases()[w.a.clip_left]) ||
+                               (q + 1 == w.rle.bases.size() && w.a.clip_right > 0 &&
+                                w.a.bases()[w.a.bases().size() - w.a.clip_right - 1] ==
+                                    w.a.bases()[w.a.bases().size() - w.a.clip_right]);
+                if (op == '=' && ref[r] != 'N' && !partial) {
+                  bool eligible = local_votes.empty() || local_votes[operation];
+                  if (!eligible) {
+                    ++filtered_hpc_votes;
+                    filtered_read = true;
+                  }
+                  auto len = w.rle.lengths[q];
+                  if (eligible) {
+                    int vote_tier = w.a.tier + (w.unique ? 0 : int(o.tiers.size()));
+                    if (!evidence_mask.empty() && evidence_mask[r] &&
+                        !evidence_excluded.count(w.a.id))
+                      ++evidence[{r, vote_tier}][len];
+                    add_vote(r, len, 1, w.unique ? 1 : 2);
                   }
                 }
+                if (op != 'D')
+                  ++q;
+                if (op != 'I')
+                  ++r;
+                ++operation;
               }
-              if (op != 'D')
-                ++q;
-              if (op != 'I')
-                ++r;
-              ++operation;
+              locally_filtered_reads += filtered_read;
             }
-            locally_filtered_reads += filtered_read;
+            w.rle = {};
+            // clear() alone retains string capacity; swap releases no-longer-needed
+            // storage. Never keep per-base traces for the entire chromosome.
+            if ((o.polish || !o.cram.empty()) && w.reason.empty())
+              w.trace = cigar(w.trace);
+            else {
+              std::string().swap(w.trace);
+              std::string().swap(w.a.sequence);
+              w.a.shared_sequence.reset();
+            }
           }
-          w.rle = {};
-          // clear() alone retains string capacity; swap releases no-longer-needed
-          // storage. Never keep per-base traces for the entire chromosome.
-          if ((o.polish || !o.cram.empty()) && w.reason.empty())
-            w.trace = cigar(w.trace);
-          else {
-            std::string().swap(w.trace);
-            std::string().swap(w.a.sequence);
-            w.a.shared_sequence.reset();
-          }
+          batch = end;
         }
-        batch = end;
+        // A qualifying unique tier seals the call before any ambiguous tier
+        // is considered. Otherwise retain its histogram for same-tier pooling.
+        for (size_t run = 0; run < ref.size(); ++run) {
+          auto &bin = bins[run];
+          if (!bin.count)
+            continue;
+          auto it = overflow.find(run);
+          Call candidate{bin.length, bin.count, bin.count, int(tier)};
+          if (it != overflow.end()) {
+            it->second[bin.length] = bin.count;
+            candidate = call({it->second}, 1, o.experiment_mean);
+          }
+          bool qualified = candidate.depth >= o.min_support;
+          if (!pooled_phase && !qualified && o.ambiguous_fallback) {
+            pending[tier].push_back({run, bin.length, bin.count});
+            if (it != overflow.end())
+              for (auto [length, count] : it->second)
+                if (length != bin.length)
+                  pending[tier].push_back({run, length, count});
+          } else if (qualified || selected[run].tier < 0) {
+            // Sparse calls are tentative: a later qualifying tier overrides
+            // them, but another sparse tier cannot displace the first one.
+            candidate.tier = int(tier + ((vote_classes[run] & 2) ? nt : 0));
+            uint32_t uncalibrated = candidate.length;
+            auto model = models.find(int(tier));
+            if (model != models.end())
+              candidate.length =
+                  it == overflow.end()
+                      ? model->second.estimate_single(ref[run], bin.length, bin.count)
+                      : model->second.estimate(ref[run], it->second, candidate.length);
+            selected[run] = candidate;
+            selected_flags[run] = (qualified ? 1 : 0) | (candidate.length != uncalibrated ? 2 : 0) |
+                                  (vote_classes[run] == 3 ? 4 : 0);
+          }
+          bin = {};
+          vote_classes[run] = 0;
+        }
+        overflow.clear();
       }
+      // Release accumulation storage before allocating raw-coordinate prefixes.
+      std::vector<RunBin>().swap(bins);
+      std::vector<uint8_t>().swap(vote_classes);
+      std::vector<std::vector<SparseVote>>().swap(pending);
+      std::vector<std::vector<size_t>>().swap(groups);
       memory_stage("HPC evidence complete");
       for (const auto &[key, histogram] : evidence) {
         auto [run, tier] = key;
@@ -1008,36 +1073,8 @@ int main(int argc, char **argv) {
       // prefix is the exact HPC-run -> draft-base coordinate transform; the
       // sentinel supports reads ending at the final template run boundary.
       for (size_t i = 0; i < ref.size(); ++i) {
-        Call c;
-        for (size_t t = 0; t < histogram_tiers; ++t) {
-          auto &bin = bins[i * histogram_tiers + t];
-          if (bin.tier < 0)
-            continue;
-          auto it = overflow.find(i * histogram_tiers + t);
-          Call candidate;
-          auto model = models.find(bin.tier % int(o.tiers.size()));
-          if (it == overflow.end()) {
-            if (bin.count >= o.min_support)
-              candidate = {bin.length, bin.count, bin.count, bin.tier};
-            if (c.tier < 0 && candidate.tier >= 0 && model != models.end()) {
-              candidate.length = model->second.estimate_single(ref[i], bin.length, bin.count);
-              model_changed_runs += candidate.length != bin.length;
-            }
-          } else {
-            it->second[bin.length] = bin.count;
-            candidate = call({it->second}, o.min_support, o.experiment_mean);
-            if (candidate.tier >= 0)
-              candidate.tier = bin.tier;
-            if (c.tier < 0 && candidate.tier >= 0 && model != models.end()) {
-              auto calibrated = model->second.estimate(ref[i], it->second, candidate.length);
-              model_changed_runs += calibrated != candidate.length;
-              candidate.length = calibrated;
-            }
-            overflow.erase(it);
-          }
-          if (c.tier < 0 && candidate.tier >= 0)
-            c = candidate;
-        }
+        Call c = selected[i];
+        model_changed_runs += bool(selected_flags[i] & 2);
         if (c.tier < 0) {
           ++no_evidence;
           require(!o.missing_error, "No evidence at " + name + ":" + std::to_string(i));
@@ -1051,13 +1088,14 @@ int main(int argc, char **argv) {
               << '\t' << c.length << '\t'
               << (c.tier < 0 ? "NO_EVIDENCE" : o.tiers[c.tier % o.tiers.size()].label) << '\t'
               << c.depth << '\t' << c.peak << '\t'
-              << (c.tier < 0       ? "NONE"
-                  : ambiguous_call ? "AMBIGUOUS"
-                                   : "UNIQUE")
+              << (c.tier < 0                ? "NONE"
+                  : (selected_flags[i] & 4) ? "POOLED"
+                  : ambiguous_call          ? "AMBIGUOUS"
+                                            : "UNIQUE")
               << '\n';
       }
-      std::vector<RunBin>().swap(bins);
-      overflow.clear();
+      std::vector<Call>().swap(selected);
+      std::vector<uint8_t>().swap(selected_flags);
       memory_stage("draft called");
       size_t crop_begin = 0, crop_end = draft.size();
       if (o.region) {

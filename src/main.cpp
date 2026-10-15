@@ -2,6 +2,9 @@
 // Pipeline: package prepass -> per-tig offset -> batched HPC votes -> expansion
 // -> optional raw alignment/polish -> optional final-reference CRAM export.
 #include "core.hpp"
+#include "options.hpp"
+#include "io.hpp"
+#include "parallel.hpp"
 #include "sqStore.H"
 #include "tgTig.H"
 #include "files.H"
@@ -25,287 +28,9 @@
 
 namespace fs = std::filesystem;
 using namespace hpc;
-struct Options {
-  // These defaults are part of the CLI contract; update help, README, and tests
-  // together whenever changing an algorithmic threshold or resource policy.
-  std::string input, templates, tig_map, output, cram;
-  std::string evidence_sites, evidence_exclude_reads;
-  std::map<std::string, std::string> model_paths;
-  std::vector<Tier> tiers;
-  unsigned threads = 1, min_support = 5, polish_support = 5;
-  size_t batch_bases = 8000000;
-  double max_error = 0.15, polish_fraction = 0.9;
-  double local_hpc_error = 0.15;
-  size_t local_hpc_radius = 500;
-  bool filter_hpc = true;
-  size_t max_indel = 500;
-  bool polish = false, drop_unmatched = false, missing_error = false;
-  bool experiment_mean = false, ambiguous_fallback = true;
-  bool region = false;
-  uint32_t region_tig = 0;
-  size_t region_begin = 0, region_end = 0, region_flank = 100000;
-};
 static void require(bool b, const std::string &s) {
   if (!b)
     throw std::runtime_error(s);
-}
-static unsigned number(const std::string &s) {
-  size_t used = 0;
-  auto n = std::stoul(s, &used);
-  require(used == s.size() && n > 0 && n <= UINT32_MAX, "Expected positive integer: " + s);
-  return n;
-}
-static size_t coordinate(const std::string &s) {
-  require(!s.empty() && s.find_first_not_of("0123456789") == std::string::npos,
-          "Expected nonnegative coordinate: " + s);
-  auto n = std::stoull(s);
-  require(n <= SIZE_MAX && n <= INT64_MAX, "Coordinate out of range: " + s);
-  return size_t(n);
-}
-static void parse_region(Options &o, const std::string &s) {
-  require(!o.region, "Specify --region only once");
-  auto colon = s.find(':');
-  auto dash = s.find('-', colon == std::string::npos ? 0 : colon + 1);
-  require(s.rfind("tig", 0) == 0 && colon != std::string::npos && dash != std::string::npos,
-          "Expected --region tig00000109:0-10000000 (draft bases, zero-based half-open)");
-  auto id = coordinate(s.substr(3, colon - 3));
-  require(id <= UINT32_MAX, "Region tig ID out of range");
-  o.region_tig = uint32_t(id);
-  o.region_begin = coordinate(s.substr(colon + 1, dash - colon - 1));
-  o.region_end = coordinate(s.substr(dash + 1));
-  require(o.region_begin < o.region_end, "Region must have begin < end");
-  o.region = true;
-}
-static double probability(const std::string &s) {
-  size_t used = 0;
-  double x = std::stod(s, &used);
-  require(used == s.size() && std::isfinite(x) && x > 0 && x <= 1,
-          "Expected probability in (0,1]: " + s);
-  return x;
-}
-static Options parse(int argc, char **argv) {
-  Options o;
-  for (int i = 1; i < argc; ++i) {
-    std::string a = argv[i];
-    auto value = [&]() {
-      require(i + 1 < argc, "Missing value for " + a);
-      return std::string(argv[++i]);
-    };
-    if (a == "call")
-      continue;
-    if (a == "--help" || a == "-h") {
-      std::cout
-          << "hpc-consensus 0.1.0\nUsage: hpc-consensus --import part.cnspack --template-hpc "
-             "paths.fa\n"
-             "  --tier 'hifi=hifi_*' --tier 'other=*' --output PREFIX [options]\n"
-             "--template-hpc FILE   Required when package has no embedded HPC bases\n"
-             "Template offsets are inferred per tig; singleton reads pass through directly.\n"
-             "--tig-map FILE        Template association: internal_ID FASTA_name per line\n"
-             "Output names are tig + eight-digit packaged tig ID (e.g. tig00000109).\n"
-             "--region TIG:BEGIN-END  One tig, zero-based half-open uncompressed draft bases\n"
-             "--region-flank N      Context in bases/runs (default 100000; region mode only)\n"
-             "--experiment-run-mean  Diagnostic rounded-mean run caller (default: mode)\n"
-             "--evidence-sites FILE  Export all-tier HPC histograms at TIG RUN rows (zero-based)\n"
-             "--evidence-exclude-reads FILE  Read IDs excluded only from diagnostic histograms\n"
-             "--unique-only        Disable default fallback to multiply placed reads\n"
-             "--ambiguous-fallback Pool within tiers if no unique tier qualifies (default)\n"
-             "--tier [LABEL=]GLOB   Repeated in priority order; first matching glob wins\n"
-             "--tier-model LABEL=FILE  Optional calibrated run-length model for one tier\n"
-             "--unmatched error|drop (default error)\n--min-run-support N (default 5)\n"
-             "Try unique tiers, then pooled tiers; sparse evidence is retained as last resort.\n"
-             "--missing-run one|error (default one)\n--max-error F (default 0.15)\n"
-             "--hpc-filter-radius N  Local vote window radius in HPC operations (default 500)\n"
-             "--hpc-filter-error F   Maximum local X/I/D fraction (default 0.15)\n"
-             "--no-hpc-filter        Disable local vote filtering for comparisons\n"
-             "--threads N (default 1; parallel alignments within each tig)\n"
-             "--batch-bases N (default 8000000; raw bases per HPC alignment batch)\n"
-             "--polish-non-hpc      Optional conservative correction\n"
-             "--min-polish-support N (default 5)\n--min-polish-fraction F (default 0.9)\n"
-             "--max-polish-indel N (default 500)\n"
-             "--cram FILE          Optional embedded-reference CRAM; requires samtools on PATH\n"
-             "Input packages must match the linked Verkko store ABI. Outputs must not exist.\n";
-      std::exit(0);
-    } else if (a == "--import")
-      o.input = value();
-    else if (a == "--template-hpc")
-      o.templates = value();
-    else if (a == "--tig-map")
-      o.tig_map = value();
-    else if (a == "--region")
-      parse_region(o, value());
-    else if (a == "--region-flank")
-      o.region_flank = coordinate(value());
-    else if (a == "--output")
-      o.output = value();
-    else if (a == "--cram")
-      o.cram = value();
-    else if (a == "--polish-non-hpc")
-      o.polish = true;
-    else if (a == "--experiment-run-mean")
-      o.experiment_mean = true;
-    else if (a == "--evidence-sites")
-      o.evidence_sites = value();
-    else if (a == "--evidence-exclude-reads")
-      o.evidence_exclude_reads = value();
-    else if (a == "--tier-model") {
-      auto v = value();
-      auto equal = v.find('=');
-      require(equal != std::string::npos && equal > 0 && equal + 1 < v.size(),
-              "Expected --tier-model LABEL=FILE");
-      require(o.model_paths.emplace(v.substr(0, equal), v.substr(equal + 1)).second,
-              "Duplicate tier model");
-    } else if (a == "--ambiguous-fallback" || a == "--experiment-ambiguous-fallback")
-      o.ambiguous_fallback = true;
-    else if (a == "--unique-only")
-      o.ambiguous_fallback = false;
-    else if (a == "--threads")
-      o.threads = number(value());
-    else if (a == "--batch-bases")
-      o.batch_bases = number(value());
-    else if (a == "--min-run-support")
-      o.min_support = number(value());
-    else if (a == "--min-polish-support")
-      o.polish_support = number(value());
-    else if (a == "--max-polish-indel")
-      o.max_indel = number(value());
-    else if (a == "--hpc-filter-radius")
-      o.local_hpc_radius = number(value());
-    else if (a == "--hpc-filter-error")
-      o.local_hpc_error = probability(value());
-    else if (a == "--no-hpc-filter")
-      o.filter_hpc = false;
-    else if (a == "--max-error")
-      o.max_error = probability(value());
-    else if (a == "--min-polish-fraction")
-      o.polish_fraction = probability(value());
-    else if (a == "--unmatched") {
-      auto v = value();
-      require(v == "error" || v == "drop", "Invalid unmatched policy");
-      o.drop_unmatched = v == "drop";
-    } else if (a == "--missing-run") {
-      auto v = value();
-      require(v == "one" || v == "error", "Invalid missing-run policy");
-      o.missing_error = v == "error";
-    } else if (a == "--tier") {
-      auto v = value();
-      auto p = v.find('=');
-      Tier t = p == std::string::npos ? Tier{"tier" + std::to_string(o.tiers.size()), v}
-                                      : Tier{v.substr(0, p), v.substr(p + 1)};
-      require(!t.label.empty() && !t.pattern.empty(), "Empty tier label/pattern");
-      require(t.label.find_first_not_of(
-                  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") ==
-                  std::string::npos,
-              "Invalid tier label");
-      for (const auto &old : o.tiers)
-        require(old.label != t.label, "Duplicate tier label");
-      o.tiers.push_back(t);
-    } else
-      throw std::runtime_error("Unknown option: " + a);
-  }
-  require(!o.input.empty() && !o.output.empty() && !o.tiers.empty(),
-          "Require --import, --output and at least one --tier; see --help");
-  require(o.polish_fraction > 0.5, "Polishing fraction must exceed 0.5");
-  require(o.model_paths.empty() || !o.experiment_mean,
-          "--tier-model cannot be combined with --experiment-run-mean");
-  for (const auto &[label, path] : o.model_paths)
-    require(std::any_of(o.tiers.begin(), o.tiers.end(),
-                        [&](const auto &tier) { return tier.label == label; }),
-            "Model refers to unknown tier: " + label);
-  require(o.evidence_exclude_reads.empty() || !o.evidence_sites.empty(),
-          "--evidence-exclude-reads requires --evidence-sites");
-  require(
-      o.evidence_sites.empty() || !o.region,
-      "Evidence export uses complete template coordinates; extract a fixture instead of --region");
-  require(!o.region || o.region_end <= size_t(INT64_MAX) - o.region_flank,
-          "Region plus flank overflows coordinate range");
-  return o;
-}
-static std::map<std::string, std::string> fasta(const std::string &path) {
-  // Read plain FASTA only. Header descriptions are ignored, while duplicate IDs
-  // are errors: silently replacing a template could select the wrong chromosome.
-  std::map<std::string, std::string> out;
-  if (path.empty())
-    return out;
-  std::ifstream in(path);
-  require(bool(in), "Cannot open template " + path);
-  std::string line, key;
-  while (std::getline(in, line)) {
-    if (line.empty())
-      continue;
-    if (line[0] == '>') {
-      std::istringstream fields(line.substr(1));
-      fields >> key;
-      require(!key.empty() && !out.count(key), "Duplicate/empty template name");
-      out[key] = {};
-    } else {
-      require(!key.empty(), "Sequence before FASTA header");
-      for (unsigned char c : line)
-        if (!std::isspace(c))
-          out[key] += std::toupper(c);
-    }
-  }
-  return out;
-}
-// Keep template names independent of output names. A supplied map is authoritative:
-// never infer an ID from a piece suffix when the package has its own numbering.
-static std::map<uint32_t, std::string> template_names(const std::string &path) {
-  std::map<uint32_t, std::string> names;
-  if (path.empty())
-    return names;
-  std::ifstream in(path);
-  require(bool(in), "Cannot open tig map " + path);
-  std::set<std::string> seen;
-  std::string line;
-  size_t line_number = 0;
-  while (std::getline(in, line)) {
-    ++line_number;
-    std::istringstream fields(line);
-    std::string id, name, extra;
-    if (!(fields >> id) || id[0] == '#')
-      continue;
-    const auto context = " in tig map at line " + std::to_string(line_number);
-    // Verkko emits a human-readable table heading. Recognize its exact tokens
-    // only before data, so malformed mapping rows are still reported as errors.
-    if (names.empty() && id == "tigID") {
-      std::string trailing;
-      require(bool(fields >> name >> extra) && name == "tig" && extra == "name" &&
-                  !(fields >> trailing),
-              "Invalid tig map heading" + context);
-      continue;
-    }
-    if (names.empty() && id.find_first_not_of('-') == std::string::npos) {
-      require(bool(fields >> name) && name.find_first_not_of('-') == std::string::npos &&
-                  !(fields >> extra),
-              "Invalid tig map separator" + context);
-      continue;
-    }
-    require(bool(fields >> name) && !(fields >> extra), "Expected ID NAME" + context);
-    require(id.find_first_not_of("0123456789") == std::string::npos,
-            "Invalid internal tig ID" + context);
-    auto value = std::stoull(id);
-    require(value <= UINT32_MAX, "Internal tig ID out of range" + context);
-    require(names.emplace(uint32_t(value), name).second, "Duplicate internal tig ID" + context);
-    require(seen.insert(name).second, "Duplicate template name" + context);
-  }
-  return names;
-}
-static void run(std::vector<std::string> args) {
-  // No shell interpolation: filenames and tier-derived strings remain arguments.
-  std::vector<char *> ptr;
-  for (auto &a : args)
-    ptr.push_back(a.data());
-  ptr.push_back(nullptr);
-  pid_t pid = fork();
-  require(pid >= 0, "fork failed");
-  if (pid == 0) {
-    execvp(ptr[0], ptr.data());
-    perror(ptr[0]);
-    _exit(127);
-  }
-  int status = 0;
-  require(waitpid(pid, &status, 0) == pid, "waitpid failed");
-  require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-          "Command failed: " + args[0] + " " + args[1]);
 }
 struct ReadOwner {
   // Placements share immutable sequence storage; construct reverse orientation
@@ -355,6 +80,7 @@ struct Work {
   // after voting. Alignment::ops has its own explicit packed_ops discriminator.
   Alignment a;
   size_t hbegin = 0, hend = 0;
+  size_t original_clip_left = 0, original_clip_right = 0;
   Rle rle;
   std::string trace, reason;
   bool boundary_left = false, boundary_right = false;
@@ -463,28 +189,10 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
                            std::to_string(out.attempted) + " reads (" +
                            std::to_string(estimates.size()) + " unique placements)");
 }
-template <class F> static void parallel(size_t n, unsigned nt, F action) {
-  // Each worker owns one Work slot; histogram accumulation is serial afterward.
-  // Actions must catch per-read failures themselves: exceptions cannot cross threads.
-  std::atomic<size_t> next{0};
-  std::vector<std::thread> workers;
-  for (size_t t = 0; t < std::min<size_t>(n, nt); ++t)
-    workers.emplace_back([&]() {
-      for (size_t i; (i = next.fetch_add(1)) < n;)
-        action(i);
-    });
-  for (auto &t : workers)
-    t.join();
-}
-static void write_fasta(std::ostream &f, const std::string &name, const std::string &s) {
-  f << '>' << name << '\n';
-  for (size_t p = 0; p < s.size(); p += 80)
-    f << s.substr(p, 80) << '\n';
-}
 int main(int argc, char **argv) {
   fs::path staging;
   try {
-    Options o = parse(argc, argv);
+    Options o = parse_options(argc, argv);
     auto templates = fasta(o.templates);
     auto mapped_names = template_names(o.tig_map);
     std::map<int, RunModel> models;
@@ -510,7 +218,8 @@ int main(int argc, char **argv) {
         std::istringstream row(line);
         std::string name, pos, extra;
         require(bool(row >> name >> pos) && !(row >> extra), "Expected TIG RUN in evidence sites");
-        require(evidence_sites[name].insert(coordinate(pos)).second, "Duplicate evidence site");
+        require(evidence_sites[name].insert(parse_coordinate(pos)).second,
+                "Duplicate evidence site");
       }
       require(in.eof(), "Cannot read evidence sites");
     }
@@ -519,11 +228,14 @@ int main(int argc, char **argv) {
       require(bool(in), "Cannot open evidence read exclusions");
       std::string id;
       while (in >> id)
-        evidence_excluded.insert(number(id));
+        evidence_excluded.insert(parse_positive_integer(id));
       require(in.eof(), "Cannot read evidence exclusions");
     }
     std::vector<std::string> suffixes = {".fasta", ".run-calls.tsv", ".read-decisions.tsv",
                                          ".summary.json", ".template-offsets.tsv"};
+    const bool extend = (o.polish || o.extend) && !o.no_extend;
+    if (extend)
+      suffixes.push_back(".end-extensions.tsv");
     if (o.region)
       suffixes.push_back(".region.tsv");
     if (!o.evidence_sites.empty())
@@ -556,6 +268,9 @@ int main(int argc, char **argv) {
     auto &fa = outputs[".fasta"];
     auto &calls = outputs[".run-calls.tsv"];
     auto &decisions = outputs[".read-decisions.tsv"];
+    if (extend)
+      outputs[".end-extensions.tsv"] << "tig\toriginal_draft_length\tleft_added\tright_added\tleft_"
+                                        "candidates\tright_candidates\n";
     if (!models.empty()) {
       outputs[".models.tsv"] << "tier\tmodel_path\n";
       for (const auto &[label, path] : o.model_paths)
@@ -582,7 +297,8 @@ int main(int argc, char **argv) {
     }
     uint64_t tigs = 0, read_count = 0, used = 0, dropped = 0, no_evidence = 0, n_edits = 0,
              n_cram = 0, exact = 0, base_alignments = 0, ambiguous_run_calls = 0,
-             model_changed_runs = 0, filtered_hpc_votes = 0, locally_filtered_reads = 0;
+             model_changed_runs = 0, filtered_hpc_votes = 0, locally_filtered_reads = 0,
+             left_added = 0, right_added = 0;
     std::set<uint32_t> tig_ids, emitted_ids;
     std::map<uint32_t, unsigned> occurrences, declared;
     sqRead_setDefaultVersion(sqRead_raw | sqRead_normal);
@@ -736,6 +452,7 @@ int main(int argc, char **argv) {
       std::string name = label.str();
       require(name.find_first_of("\t\r\n ") == std::string::npos, "Invalid contig name");
       std::string ref = template_for(tig, o, templates, mapped_names);
+      const size_t complete_template_size = ref.size();
       if (o.region && tig.numberOfChildren() != 1)
         ref.resize(region_hpc_end);
       std::vector<Work> work;
@@ -787,6 +504,8 @@ int main(int argc, char **argv) {
                   "Invalid raw clipping");
           w.a.clip_left = p->_askip;
           w.a.clip_right = p->_bskip;
+          w.original_clip_left = w.a.clip_left;
+          w.original_clip_right = w.a.clip_right;
         }
         work.push_back(std::move(w));
       }
@@ -844,9 +563,9 @@ int main(int argc, char **argv) {
               "Tig " + name +
                   " has no HPC template; check --template-hpc and --tig-map associations");
       for (size_t i = 0; i < ref.size(); ++i)
-        require(std::string("ACGTN").find(ref[i]) != std::string::npos &&
-                    (!i || ref[i] != ref[i - 1]),
-                "Template is not homopolymer compressed: " + name);
+        if (std::string_view("ACGTN").find(ref[i]) == std::string_view::npos ||
+            (i && ref[i] == ref[i - 1]))
+          throw std::runtime_error("Template is not homopolymer compressed: " + name);
       auto inferred = o.region ? region_offset : infer_offset(work, tig.length(), ref, o.max_error);
       int64_t offset = inferred.value;
       outputs[".template-offsets.tsv"]
@@ -955,6 +674,8 @@ int main(int argc, char **argv) {
                 w.trace = std::move(a.ops);
               } else
                 w.trace = align(w.rle.bases, target, o.max_error);
+            } catch (const std::bad_alloc &) {
+              throw;
             } catch (const std::exception &e) {
               w.reason = "HPC_ALIGNMENT_FAILED";
             }
@@ -963,7 +684,7 @@ int main(int argc, char **argv) {
             auto &w = work[order[i]];
             if (w.reason.empty() && (w.unique || (o.ambiguous_fallback && w.placements > 1))) {
               ++used;
-              if (w.rle.bases == ref.substr(w.hbegin, w.hend - w.hbegin))
+              if (ref.compare(w.hbegin, w.hend - w.hbegin, w.rle.bases) == 0)
                 ++exact;
               auto local_votes =
                   o.filter_hpc ? local_hpc_votes(w.trace, o.local_hpc_radius, o.local_hpc_error)
@@ -1003,7 +724,7 @@ int main(int argc, char **argv) {
             w.rle = {};
             // clear() alone retains string capacity; swap releases no-longer-needed
             // storage. Never keep per-base traces for the entire chromosome.
-            if ((o.polish || !o.cram.empty()) && w.reason.empty())
+            if ((o.polish || extend || !o.cram.empty()) && w.reason.empty())
               w.trace = cigar(w.trace);
             else {
               std::string().swap(w.trace);
@@ -1114,7 +835,7 @@ int main(int argc, char **argv) {
             w.a.shared_sequence.reset();
           }
       }
-      if (o.polish || !o.cram.empty()) {
+      if (o.polish || extend || !o.cram.empty()) {
         parallel(work.size(), o.threads, [&](size_t i) {
           auto &w = work[i];
           if (!w.reason.empty())
@@ -1154,6 +875,8 @@ int main(int argc, char **argv) {
             md(w.a, draft, nm);
             w.a.ops = cigar(w.a.ops);
             w.a.packed_ops = true;
+          } catch (const std::bad_alloc &) {
+            throw;
           } catch (const std::exception &e) {
             w.reason = "FINAL_ALIGNMENT_FAILED";
             std::string().swap(w.a.ops);
@@ -1169,9 +892,41 @@ int main(int argc, char **argv) {
         std::string().swap(w.trace);
       std::vector<size_t>().swap(prefix);
       memory_stage("raw alignments complete");
+      if (extend) {
+        std::vector<EndRead> terminal;
+        for (auto &w : work)
+          if (w.reason.empty())
+            terminal.push_back({&w.a, w.unique, w.a.clip_left - w.original_clip_left,
+                                w.a.clip_right - w.original_clip_right,
+                                w.unique || w.placements > 1});
+        size_t before = draft.size();
+        // Regional crops are not biological ends. Right extension is allowed
+        // only if processing reached the complete original template boundary.
+        auto added = extend_ends(
+            draft, terminal, o.tiers.size(), models, o.end_support, o.max_end_extension,
+            o.max_error, o.ambiguous_fallback, o.extend_left && crop_begin == 0,
+            o.extend_right && crop_end == before && ref.size() == complete_template_size);
+        left_added += added.left;
+        right_added += added.right;
+        outputs[".end-extensions.tsv"] << name << '\t' << before << '\t' << added.left << '\t'
+                                       << added.right << '\t' << added.left_candidates << '\t'
+                                       << added.right_candidates << '\n';
+        crop_end += added.left + added.right;
+        // Interior traces were already validated; a uniform coordinate shift
+        // does not require another chromosome-wide decode/MD pass.
+        for (const auto &r : terminal)
+          if (r.left || r.right) {
+            size_t nm;
+            md(*r.alignment, draft, nm);
+          }
+        std::cerr << "tig " << name << ": extended left " << added.left << ", right " << added.right
+                  << " bases (anchored molecules " << added.left_candidates << ", "
+                  << added.right_candidates << ")\n";
+      }
       std::vector<Accepted> edits;
       if (o.polish) {
-        write_fasta(outputs[".draft.fasta"], name, draft.substr(crop_begin, crop_end - crop_begin));
+        write_fasta(outputs[".draft.fasta"], name,
+                    std::string_view(draft).substr(crop_begin, crop_end - crop_begin));
         std::vector<const Alignment *> alns;
         for (auto &w : work)
           if (w.reason.empty() && (w.unique || (o.ambiguous_fallback && w.placements > 1))) {
@@ -1212,7 +967,9 @@ int main(int argc, char **argv) {
               << ";AC=" << e.support << '\n';
         }
       }
-      std::string final = hpc::apply(draft, edits);
+      // No later phase needs the old draft. Fast/CRAM-only runs and unchanged
+      // polished tigs can transfer its storage instead of copying a chromosome.
+      std::string final = edits.empty() ? std::move(draft) : hpc::apply(draft, edits);
       size_t final_begin = lift(crop_begin, edits), final_end = lift(crop_end, edits);
       std::string region_reference;
       if (o.region) {
@@ -1264,6 +1021,8 @@ int main(int argc, char **argv) {
                    << c << "\t*\t0\t0\t" << w.a.bases() << "\t*\tRG:Z:" << o.tiers[w.a.tier].label
                    << "\tNM:i:" << nm << "\tMD:Z:" << mdtag << "\tAS:i:" << -int64_t(nm) << '\n';
               ++n_cram;
+            } catch (const std::bad_alloc &) {
+              throw;
             } catch (const std::exception &e) {
               w.reason = "FINAL_ALIGNMENT_FAILED";
             }
@@ -1290,6 +1049,8 @@ int main(int argc, char **argv) {
                              << ",\n  \"filtered_hpc_votes\": " << filtered_hpc_votes
                              << ",\n  \"locally_filtered_reads\": " << locally_filtered_reads
                              << ",\n  \"non_hpc_edits\": " << n_edits
+                             << ",\n  \"left_extension_bases\": " << left_added
+                             << ",\n  \"right_extension_bases\": " << right_added
                              << ",\n  \"base_alignments\": " << base_alignments
                              << ",\n  \"cram_records\": " << n_cram << "\n}\n";
     for (auto &[s, f] : outputs)

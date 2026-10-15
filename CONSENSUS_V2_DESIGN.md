@@ -1,6 +1,6 @@
 # Design status and implementation guide
 
-Updated: 2026-10-13
+Updated: 2026-10-14
 
 This file includes the original 2026-10-02 proposal below for rationale and
 research context. It is historical: where it conflicts with this status section,
@@ -9,6 +9,14 @@ behavior. Proposed options and guarantees below are not automatically supported.
 
 ## Current implementation versus original proposal
 
+- Coverage-supported recovery of template-clipped overhangs is enabled with
+  polishing, or separately with `--extend-ends`, at both real tig ends. Every
+  added run requires five distinct molecules by default; packaged raw clips
+  and artificial regional boundaries are preserved. Seeded HPC tail alignment
+  and run calling use bounded terminal scratch; the original interior is not
+  changed by extension. Raw clips/traces and left-shifted coordinates are updated
+  for final CRAM. `.end-extensions.tsv` records coordinate shifts; see README for
+  seed limitations, caps, controls and the unextended run-call coordinate system.
 - Local HPC vote filtering is enabled by default: centered radius 500 operations,
   maximum X/I/D fraction 0.15. It preserves clean portions of reads and gates
   diagnostic histograms identically to consensus votes. It does not alter read

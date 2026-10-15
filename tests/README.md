@@ -68,5 +68,24 @@ Once supplied, the planned checks are:
   indels, and homopolymer errors separately and accounting for circular origin,
   orientation, and genuine strain differences.
 
-No E. coli test has been run yet. This checklist does not imply a benchmark
-result or authorize changes to the supplied source data.
+This checklist describes how to repeat a biological evaluation; synthetic test
+success alone is not a biological quality claim. Keep benchmark inputs and
+results outside the tracked test suite.
+
+## Maintenance and equivalence tests
+
+`maintenance` runs 1,000 deterministic differential cases for insertion
+normalization and edit application, covering packed/expanded traces, long repeat
+shifts, substitutions, deletions and insertions. It also checks malformed edit
+intervals, numeric parsing and FASTA wrapping. Checks stay enabled in Release.
+Worker tests verify exactly-once execution and joined propagation of allocation
+failures. Sanitizer builds are described in `../MAINTAINING.md`.
+
+`compare_versions.py` accepts two executables and common native input arguments.
+It compares all generated text artifacts and decoded CRAM records, retaining
+timing logs and a JSON report in a new directory. See `../MAINTAINING.md` for
+usage, module boundaries, coordinate contracts and benchmarking cautions.
+
+Both biological end directions have synthetic regressions: molecule-count
+support, reverse orientation, automatic/explicit/disabled extension, side flags,
+internal regional boundaries and CRAM NM/MD validation.

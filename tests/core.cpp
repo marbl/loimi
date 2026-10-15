@@ -2,6 +2,7 @@
 // Small deterministic contracts for coordinate transforms, evidence selection,
 // and packed traces. Throwing checks remain active in Release builds (unlike assert).
 #include "core.hpp"
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <random>
@@ -12,6 +13,50 @@ static void check(bool v, const char *msg) {
     throw std::runtime_error(msg);
 }
 int main() {
+  {
+    std::string interior;
+    for (int i = 0; i < 50; ++i)
+      interior += "ACGT";
+    std::vector<Alignment> alns(5);
+    std::vector<EndRead> reads;
+    for (size_t i = 0; i < alns.size(); ++i) {
+      auto &a = alns[i];
+      a.id = i + 1;
+      a.sequence = "CCAATTGGCC" + interior + "GGTTAACCGG";
+      a.clip_left = a.clip_right = 10;
+      a.begin = 0;
+      a.end = interior.size();
+      a.ops = cigar(std::string(interior.size(), '='));
+      a.packed_ops = true;
+      reads.push_back({&a, true, 10, 10});
+    }
+    auto reference = interior;
+    auto added = extend_ends(reference, reads, 1, {}, 5, 100, .15, true, true, true);
+    check(added.left == 8 && added.right == 8, "Both ends stop before truncated terminal runs");
+    check(reference == "AATTGGCC" + interior + "GGTTAACC", "End extension preserves interior");
+    for (auto &a : alns) {
+      size_t nm;
+      md(a, reference, nm);
+      check(nm == 0 && a.clip_left == 2 && a.clip_right == 2, "End traces and clips updated");
+    }
+    // Four molecules cannot establish a five-molecule extension, even with
+    // repeated placement records of one molecule.
+    for (auto &a : alns) {
+      a.clip_left = a.clip_right = 10;
+      a.begin = 0;
+      a.end = interior.size();
+      a.ops = cigar(std::string(interior.size(), '='));
+    }
+    alns.back().id = alns.front().id;
+    reference = interior;
+    added = extend_ends(reference, reads, 1, {}, 5, 100, .15, true, true, true);
+    check(added.left == 0 && added.right == 0 && reference == interior,
+          "Distinct molecule depth required");
+    alns.back().id = 5;
+    reads.back().eligible = false;
+    added = extend_ends(reference, reads, 1, {}, 5, 100, .15, true, true, true);
+    check(added.left == 0 && added.right == 0, "Unknown placements cannot establish ends");
+  }
   check(local_hpc_votes(std::string(2000, '='), 500, .15).empty(), "Exact trace fast path");
   check(local_hpc_votes("", 500, .15).empty(), "Empty trace");
   std::string damaged(2000, '=');

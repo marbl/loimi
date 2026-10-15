@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT-0
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <istream>
@@ -97,6 +98,25 @@ struct Alignment {
     return shared_sequence ? *shared_sequence : sequence;
   }
 };
+// Only template-induced soft clips may be recovered; packaged raw clipping is
+// excluded by the caller. Pointers borrow existing oriented read storage.
+struct EndRead {
+  Alignment *alignment;
+  bool unique;
+  size_t left, right;
+  bool eligible = true;
+};
+struct EndExtension {
+  size_t left = 0, right = 0;
+  size_t left_candidates = 0, right_candidates = 0;
+};
+// Extend real template ends with anchored overhangs, requiring support at EVERY
+// added run (no sparse fallback). Update coordinates, clips and compact traces.
+// Internal reference sequence is unchanged. Left tails are reversed, not
+// complemented. Memory depends on bounded terminal tails, not chromosome size.
+EndExtension extend_ends(std::string &reference, const std::vector<EndRead> &reads, size_t tiers,
+                         const std::map<int, RunModel> &models, unsigned support, size_t max_bases,
+                         double max_error, bool ambiguous, bool left, bool right);
 // Intersect an alignment with reference[begin:end], rebase reference coordinates,
 // and soft-clip excluded query bases. Insertion at begin belongs to the crop;
 // insertion at end does not. Returns false if no query/reference overlap remains.

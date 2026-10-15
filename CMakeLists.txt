@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.18)
 project(hpc_consensus VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+option(HPC_ENABLE_SANITIZERS "Instrument project code with address/undefined sanitizers" OFF)
 set(VERKKO_ROOT "" CACHE PATH "Verkko checkout with build/lib/libverkko.a")
 # cnspack serialization is native-ABI dependent: compile against the same
 # headers/build used for the packages rather than vendoring a guessed reader.
@@ -18,16 +20,32 @@ find_package(Threads REQUIRED)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 # The imported OpenMP target supplies compiler flags as well as the runtime;
 # locating a libomp/libgomp filename alone is not portable across Linux/macOS.
-add_library(consensus src/core.cpp)
+add_library(consensus src/core.cpp src/models.cpp src/polish.cpp src/ends.cpp)
 target_include_directories(consensus PUBLIC src)
 # Quote-only lookup avoids utility/math.H shadowing the system math.h on macOS.
 target_compile_options(consensus PUBLIC "-iquote${VUTIL}" "-iquote${VERKKO_ROOT}/src/canu/src/stores")
-target_link_libraries(consensus PUBLIC "${VERKKO_ROOT}/build/lib/libverkko.a" ${SYSTEM_DEPS_LINK_LIBRARIES} ${ZLIB_LIBRARIES} ${BZIP2_LIBRARIES} Threads::Threads OpenMP::OpenMP_CXX)
+# zlib/bzip2 are link-only dependencies of the native archive. Their macOS
+# imported targets can inject SDK/usr/include ahead of libc++ wrappers when
+# using Homebrew Clang, so do not propagate their unused header directories.
+target_link_libraries(consensus PUBLIC "${VERKKO_ROOT}/build/lib/libverkko.a" PkgConfig::SYSTEM_DEPS ${ZLIB_LIBRARIES} ${BZIP2_LIBRARIES} Threads::Threads OpenMP::OpenMP_CXX)
+if(HPC_ENABLE_SANITIZERS)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    message(FATAL_ERROR "Sanitizers require Clang or GCC")
+  endif()
+  # Propagate to project executables; the prebuilt Verkko archive is not instrumented.
+  target_compile_options(consensus PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(consensus PUBLIC -fsanitize=address,undefined)
+endif()
 target_compile_options(consensus PRIVATE -Wall -Wextra -Wpedantic)
+add_library(consensus-io src/io.cpp src/options.cpp)
+target_link_libraries(consensus-io PUBLIC consensus)
+target_compile_options(consensus-io PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(hpc-consensus src/main.cpp)
-target_link_libraries(hpc-consensus PRIVATE consensus)
+target_compile_options(hpc-consensus PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(hpc-consensus PRIVATE consensus-io)
 install(TARGETS hpc-consensus RUNTIME DESTINATION bin)
-enable_testing()
+include(CTest)
+if(BUILD_TESTING)
 # Core tests need no input datasets. Integration generates small native packages
 # with Verkko tools, and exercises CRAM only when samtools is available on PATH.
 add_executable(core-tests tests/core.cpp)
@@ -37,6 +55,10 @@ target_link_libraries(extract-regions PRIVATE consensus)
 add_executable(apply-run-model tests/apply_run_model.cpp)
 target_link_libraries(apply-run-model PRIVATE consensus)
 add_test(NAME core COMMAND core-tests)
+add_executable(maintenance-tests tests/maintenance.cpp)
+target_link_libraries(maintenance-tests PRIVATE consensus-io)
+add_test(NAME maintenance COMMAND maintenance-tests)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME native-package COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py" "$<TARGET_FILE:hpc-consensus>" "${VERKKO_ROOT}")
 add_test(NAME calibration COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/calibration.py")
+endif()

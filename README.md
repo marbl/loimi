@@ -10,6 +10,8 @@ their own licenses; this license does not relicense them or replace their
 distribution requirements.
 
 Repository engineering expectations are in [AGENTS.md](AGENTS.md). C++ formatting
+and the module map, invariants and regression workflow are described in
+[MAINTAINING.md](MAINTAINING.md). Formatting
 is defined by `.clang-format`; use `clang-format -i src/*.cpp src/*.hpp tests/core.cpp`
 after code edits, then rebuild and run CTest as described below. Comments should
 explain invariants, ownership, coordinate conventions, and non-obvious decisions,
@@ -244,6 +246,46 @@ both must support it. Terminal events, pure run-length changes, overlapping or
 adjacent accepted edits, and alternate alleles containing N are excluded.
 There is one correction pass, not iterative polishing.
 
+### Coverage-supported end recovery
+
+Polishing now first recovers read overhangs clipped solely because the HPC
+template ended. This works at both tig ends; `--extend-ends` enables the same
+step without internal polishing, and `--no-extend-ends` preserves the previous
+boundary behavior. Fast uncompression without either option is unchanged.
+Packaged raw clipping is respected, and singleton passthrough is unchanged.
+
+Only reads anchored to the existing terminal sequence can establish an extension
+(at least 20 aligned operations, with the terminal 100-operation error fraction
+at most `--max-error`). A molecule counts once per end, even with duplicate
+placements; unknown placement counts cannot vote. A high-priority group with
+at least `--min-end-support` molecules supplies a seed path. Anchored HPC tail
+alignments collect run lengths, using unique-first then same-tier pooled
+selection and the supplied calibration models. Unlike interior calling, every
+added run must reach the end-support threshold: there is no sparse fallback.
+The last run of each tail is excluded because it may be truncated. Recovery
+stops at the first unsupported seed run or the raw-base cap.
+
+This is conservative seeded extension, not de novo assembly of arbitrary tails:
+it cannot recover a path absent from its chosen seed, may stop early at a seed
+error, and does not establish a telomere's exact biological repeat count. Read
+overhangs, including chimeric tails, still require inspection in difficult cases.
+The cap bounds terminal-tail scratch, not total process RSS. Recovered tails
+are aligned to the added sequence and remaining/unresolved bases stay soft-clipped.
+Left extension shifts all retained alignment coordinates; CRAM NM/MD and contig
+lengths use the extended, polished sequence. Neither extension changes the
+existing interior sequence itself; ordinary polishing can still edit it.
+
+`.end-extensions.tsv` records the original draft length, bases added on each
+side, and the number of anchored candidate molecules; summary JSON includes
+`left_extension_bases` and `right_extension_bases`.
+`.run-calls.tsv` remains in the **original, unextended template/draft coordinates**:
+add `left_added` to its raw coordinates before interpreting them in the extended
+draft. `.draft.fasta` and polishing VCF coordinates refer to the extended draft.
+Extension is separate from VCF edits. `--region` never extends an internal crop
+boundary; only a crop reaching a true template end can include an extension.
+For manually extracted fixtures, use `--end-extension-side right` or `left` to
+avoid treating the fixture's artificial opposite edge as a biological end.
+
 ## Options and defaults
 
 | Option | Default | Meaning |
@@ -251,6 +293,11 @@ There is one correction pass, not iterative polishing.
 | `--threads N` | 1 | Parallel per-read alignment work within a tig; also passed to samtools |
 | `--batch-bases N` | 8000000 | Approximate raw-base budget for each HPC alignment batch; a single read may exceed it |
 | `--min-run-support N` | 5 | Preferred tier depth; retain sparse evidence if none qualifies |
+| `--extend-ends` | with polishing | Recover coverage-supported template overhangs at both ends |
+| `--no-extend-ends` | off | Disable end recovery, including during polishing |
+| `--min-end-support N` | 5 | Distinct molecules required at every added run |
+| `--max-end-extension N` | 10000 | Raw-base cap per end, and per-read tail bound |
+| `--end-extension-side both\|left\|right` | both | Restrict recovery, useful for extracted fixtures |
 | `--missing-run one\|error` | one | Policy when no tier qualifies |
 | `--unmatched error\|drop` | error | Policy for eligible reads matching no tier |
 | `--max-error F` | 0.15 | Unit edit-distance cap, rounded up, relative to the longer sequence |

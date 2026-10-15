@@ -64,6 +64,41 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
             bases.append(previous)
         return "".join(bases)
     target = random_hpc(10000)
+    # Native boundary clipping must remain recoverable at BOTH biological ends.
+    core = "T" + random_hpc(498, "T")
+    core += next(b for b in "ACT" if b != core[-1])
+    left_tail, right_tail = "CCAATTGGCC", "GGTTAACCGG"
+    terminal = [(f"anchor{i}",core,10,510) for i in range(6)]
+    terminal += [(f"left{i}",left_tail+core,5,510) for i in range(5)]
+    terminal += [(f"right{i}",core+right_tail,10,515) for i in range(5)]
+    # Pack both orientations; extension must operate on reference-oriented
+    # sequence, preserving original read identity and SAM strand flags.
+    terminal = [(n, s.translate(str.maketrans('ACGT','TGCA'))[::-1],e,b)
+                if n in ('left1','left3','right1','right3') else (n,s,b,e)
+                for n,s,b,e in terminal]
+    (root/'ends.fa').write_text(''.join(f'>{n}\n{s}\n' for n,s,_,_ in terminal))
+    (root/'ends.template.fa').write_text('>1\n'+core+'\n')
+    (root/'ends.layout').write_text('tig\tends\nlen\t515\nrds\t16\n'+''.join(f'ends_{n}\t{b}\t{e}\t1\n' for n,s,b,e in terminal)+'end\n')
+    run([tools/'sqStoreCreate','-o',root/'ends.store','-minlength','1','-raw','-pacbio','ends',root/'ends.fa'])
+    run([tools/'layoutToPackage','-layout',root/'ends.layout','-store',root/'ends.store','-output',root/'ends#.endpack'])
+    endbase=[exe,'--import',next(root.glob('*.endpack')),'--template-hpc',root/'ends.template.fa','--tier','anchors=ends_anchor*','--tier','tails=*']
+    expected='AATTGGCC'+core+'GGTTAACC'
+    for label,flags,expected_seq in [
+        ('ends-fast',[],core),('ends-enabled',['--extend-ends'],expected),
+        ('ends-polish',['--polish-non-hpc'],expected),
+        ('ends-disabled',['--polish-non-hpc','--no-extend-ends'],core),
+        ('ends-low-depth',['--extend-ends','--min-end-support','6'],core),
+        ('ends-right',['--extend-ends','--end-extension-side','right'],core+'GGTTAACC')]:
+        run(endbase+flags+['--output',root/label])
+        actual_seq = sequence(root/(label+'.fasta'))
+        assert actual_seq==expected_seq,(label,len(actual_seq),len(expected_seq))
+    if shutil.which('samtools'):
+        run(endbase+['--polish-non-hpc','--cram',root/'ends.cram','--output',root/'ends-cram'])
+        checked=run(['samtools','calmd',root/'ends.cram',root/'ends-cram.fasta'])
+        assert 'different' not in checked.stderr
+        assert len(checked.stdout.splitlines()) >= 16
+    run(endbase+['--extend-ends','--region','tig00000001:100-400','--output',root/'ends-region'])
+    assert sequence(root/'ends-region.fasta')==core[100:400]
     corrupt = target[:9000] + random_hpc(1000, target[8999])
     double = lambda s: "".join(b * 2 for b in s)
     local_reads = [(f"anchor{i}", double(target[:1500])) for i in range(6)]

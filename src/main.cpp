@@ -203,7 +203,13 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
     anchors.push_back(internal_offsets(q, ref, int64_t(w.hbegin)));
   }
   try {
-    auto candidate = internal_offset_cluster(anchors, out.sparse ? 1 : 6);
+    // Small informative samples must tolerate the outliers allowed by the
+    // 75% agreement rule. Count independent reads, never individual chunks.
+    size_t informative = std::count_if(anchors.begin(), anchors.end(),
+                                       [](const auto &read) { return !read.empty(); });
+    size_t required =
+        out.sparse ? 1 : std::max<size_t>(3, std::min<size_t>(6, (3 * informative + 3) / 4));
+    auto candidate = internal_offset_cluster(anchors, required);
     size_t validated = 0;
     for (size_t j = 0; j < limit; ++j) {
       if (std::none_of(anchors[j].begin(), anchors[j].end(),

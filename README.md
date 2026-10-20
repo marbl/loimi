@@ -155,6 +155,16 @@ Each set must support a consistent offset cluster (at least three reads and
 75% of estimates within a 20-HPC-base span); the two estimates must agree
 within 20 bases. The combined cluster's lower median is used. This is a
 heuristic consistency check, not a calibrated confidence probability.
+If whole-read inference fails, the fallback tests five internal chunks per
+candidate read (up to 5,000 HPC bases each). Only chunks occurring exactly once
+in the template provide anchors. At least 75% of informative reads must agree
+within a 20-base offset span, with at least three supporting reads (one for
+sparse layouts). Each read counts once. Five agreeing reads out of six can
+therefore qualify; requiring six agreeing reads would defeat the outlier rule.
+A distant cluster with at least half as much support is rejected. At least
+three supporting reads (one for sparse layouts) must also pass predicted-overlap
+alignment, allowing overhangs at template ends. Noisy reads without exact
+internal anchors may still fail; unresolved offsets are never guessed.
 Unresolved tigs fail explicitly. Reads crossing the inferred template boundary
 are aligned semi-globally to their overlapping HPC template interval. Overhangs
 are clipped at aligned run boundaries and represented as soft clips in CRAM;
@@ -165,7 +175,9 @@ produce `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
 (the adjacent clipped base is identical), that partial run cannot vote for a
 run length. The old global `--template-offset` option has been removed.
 `PREFIX.template-offsets.tsv` records offsets, attempts, placements, validation
-support, tolerance, and method (`VALIDATED`, `SPARSE`, or `SINGLE_READ`).
+support, tolerance, and method (`VALIDATED`, `SPARSE`, `INTERNAL_OVERLAP`, or
+`SINGLE_READ`). For `INTERNAL_OVERLAP`, placements count supporting reads and
+validation support counts successful overlap alignments, not held-out reads.
 With fewer than six eligible reads in a multi-read tig, every eligible read is
 aligned and the available unique placements are clustered without held-out
 validation. At least one placement is required; inconsistent estimates still

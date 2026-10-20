@@ -89,3 +89,12 @@ usage, module boundaries, coordinate contracts and benchmarking cautions.
 Both biological end directions have synthetic regressions: molecule-count
 support, reverse orientation, automatic/explicit/disabled extension, side flags,
 internal regional boundaries and CRAM NM/MD validation.
+# Offset fallback regressions
+
+`offsets` checks internal exact anchors, repeated-template rejection, signed
+offsets, one-read-one-vote clustering, and rejection of competing clusters.
+`native-offset` generates a single native package containing two tigs with
+reads overhanging both template ends. The second has five agreeing reads,
+one offset outlier, and one uninformative read. Both full-package and region
+modes must finish with `--no-extend-ends`. No external genome data is needed.
+

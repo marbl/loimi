@@ -1,0 +1,61 @@
+"""Two-tig native regression: overhang rescue followed by small-sample rescue."""
+import pathlib
+import random
+import subprocess
+import sys
+import tempfile
+
+exe = pathlib.Path(sys.argv[1])
+tools = pathlib.Path(sys.argv[2]) / 'build/bin'
+
+
+def run(args):
+    p = subprocess.run(list(map(str, args)), capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return p.stdout + p.stderr
+
+
+with tempfile.TemporaryDirectory(prefix='hpc-offset-') as temporary:
+    root = pathlib.Path(temporary)
+    rng = random.Random(913)
+    bases = ['A']
+    for _ in range(11999):
+        bases.append(rng.choice([b for b in 'ACGT' if b != bases[-1]]))
+    sequence = ''.join(bases)
+    reference = sequence[3000:9000]
+    # Distinct read IDs across tigs preserve package-wide uniqueness. The
+    # second tig has five agreeing reads, one offset outlier, and one read
+    # with no exact internal anchors. It must not require six agreeing votes.
+    noise = ''.join(rng.choice('ACGT') for _ in range(12000))
+    (root/'reads.fa').write_text(''.join(f'>LA{group}{i}\n{sequence}\n'
+                                        for group in ('a', 'b') for i in range(6)) +
+                                 '>LAnoise\n' + noise + '\n')
+    (root/'template.fa').write_text('>1\n' + reference + '\n>2\n' + reference + '\n')
+    layouts = []
+    for group in ('a', 'b'):
+        rows = []
+        for i in range(6):
+            begin = 160 if group == 'b' and i == 5 else 100
+            rows.append(f'reads_LA{group}{i}\t{begin}\t{begin+12000}\t1\n')
+        if group == 'b':
+            rows.append('reads_LAnoise\t100\t12100\t1\n')
+        layouts.append(f'tig\tfixture{group}\nlen\t12160\nrds\t{len(rows)}\n' +
+                       ''.join(rows) + 'end\n')
+    (root/'layout').write_text(''.join(layouts))
+    run([tools/'sqStoreCreate', '-o', root/'store', '-minlength', '1',
+         '-raw', '-pacbio', 'reads', root/'reads.fa'])
+    package_log = run([tools/'layoutToPackage', '-layout', root/'layout', '-store', root/'store',
+         '-partition', '10', '1', '2', '-output', root/'part#.cnspack'])
+    # Native partition numbering may also create an empty partition zero.
+    packages = [p for p in root.glob('*.cnspack') if p.stat().st_size]
+    assert len(packages) == 1, package_log
+    package = packages[0]
+    for label, flags in [('full', []), ('region', ['--region', 'tig00000002:0-1000'])]:
+        log = run([exe, '--import', package, '--template-hpc', root/'template.fa',
+                   '--tier', 'LA=reads_LA*', '--no-extend-ends',
+                   '--output', root/label, *flags])
+        # layoutToPackage normalizes away the shared 100-base layout prefix.
+        assert 'offset rescue: internal anchors, offset 3000' in log, log
+        observed = ''.join(s for s in (root/(label+'.fasta')).read_text().splitlines()
+                           if not s.startswith('>'))
+        assert observed == (reference * 2 if label == 'full' else reference[:1000])

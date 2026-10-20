@@ -6,7 +6,6 @@
 #include "options.hpp"
 #include "io.hpp"
 #include "parallel.hpp"
-#include "experiments/hp_anchors.hpp"
 #include "sqStore.H"
 #include "tgTig.H"
 #include "files.H"
@@ -778,17 +777,7 @@ int main(int argc, char **argv) {
                                (q + 1 == w.rle.bases.size() && w.a.clip_right > 0 &&
                                 w.a.bases()[w.a.bases().size() - w.a.clip_right - 1] ==
                                     w.a.bases()[w.a.bases().size() - w.a.clip_right]);
-                bool unflanked = o.terminal_hp_filter && !experimental::has_run_flanks(
-                                                             q, w.rle.bases.size(), r, ref.size());
-                if (o.hp_flank_bases && op == '=') {
-                  // Use the aligned, clipped query rather than whole-read length:
-                  // soft-clipped bases must not qualify a censored observation.
-                  unflanked |= !experimental::has_span_flanks(
-                      w.rle.offsets.at(q), w.rle.offsets.at(q + 1), w.rle.offsets.back(),
-                      o.hp_flank_bases, operation > 0 && w.trace[operation - 1] == '=',
-                      operation + 1 < w.trace.size() && w.trace[operation + 1] == '=', r == 0,
-                      r + 1 == ref.size());
-                }
+                bool unflanked = o.terminal_hp_filter;
                 // Stream only requested sites, retaining no per-read trace table.
                 // A row reports evidence eligibility, not whether this tier won.
                 if (o.evidence_read_votes && op != 'I' && r < evidence_mask.size() &&
@@ -868,6 +857,7 @@ int main(int argc, char **argv) {
             auto m = models.find(int(tier));
             const auto &model = m == models.end() ? unmodeled : m->second;
             auto before = selected[run].length;
+			/*
             selected[run].length = model.borrow(ref[run], found->second, a, before);
             if (selected[run].length != before)
               selected_flags[run] |= 16;
@@ -875,6 +865,7 @@ int main(int argc, char **argv) {
                                       << o.tiers[tier].label << '\t' << selected[run].depth << '\t'
                                       << candidate.depth << '\t' << before << '\t'
                                       << selected[run].length << '\n';
+									  */
             bin = {};
             vote_classes[run] = 0;
             continue;
@@ -929,12 +920,6 @@ int main(int argc, char **argv) {
             selected[run] = candidate;
             selected_flags[run] = (qualified ? 1 : 0) | (candidate.length != uncalibrated ? 2 : 0) |
                                   (vote_classes[run] == 3 ? 4 : 0) | (additive ? 8 : 0);
-            if (o.consistent_ambiguous && !pooled_phase && qualified) {
-              Histogram u = it == overflow.end() ? Histogram{{bin.length, bin.count}} : it->second;
-              const auto &calibration = model == models.end() ? unmodeled : model->second;
-              if (calibration.uncertain(ref[run], u))
-                uncertain[tier].emplace(run, std::move(u));
-            }
           }
           bin = {};
           vote_classes[run] = 0;
@@ -1110,7 +1095,7 @@ int main(int argc, char **argv) {
           }
         edits =
             polish(draft, alns, o.tiers.size() * (o.ambiguous_fallback ? 2 : 1), o.polish_support,
-                   o.polish_fraction, o.max_indel, o.retain_higher_unique ? o.tiers.size() : 0);
+                   o.polish_fraction, o.max_indel);
         for (auto &w : work)
           if (w.a.tier >= int(o.tiers.size()))
             w.a.tier -= o.tiers.size();

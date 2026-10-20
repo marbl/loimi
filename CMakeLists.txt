@@ -20,7 +20,7 @@ find_package(Threads REQUIRED)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 # The imported OpenMP target supplies compiler flags as well as the runtime;
 # locating a libomp/libgomp filename alone is not portable across Linux/macOS.
-add_library(consensus src/core.cpp src/models.cpp src/polish.cpp src/ends.cpp)
+add_library(consensus src/core.cpp src/models.cpp src/polish.cpp src/ends.cpp src/offsets.cpp)
 target_include_directories(consensus PUBLIC src)
 # Quote-only lookup avoids utility/math.H shadowing the system math.h on macOS.
 target_compile_options(consensus PUBLIC "-iquote${VUTIL}" "-iquote${VERKKO_ROOT}/src/canu/src/stores")

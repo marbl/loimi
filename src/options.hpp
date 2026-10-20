@@ -12,6 +12,9 @@ struct Options {
   // together whenever changing an algorithmic threshold or resource policy.
   std::string input, templates, tig_map, output, cram;
   std::string evidence_sites, evidence_exclude_reads;
+  bool evidence_read_votes = false; // Opt-in per-placement diagnostic; never changes votes.
+  bool terminal_hp_filter = false;  // Experimental interior terminal-run exclusion.
+  size_t hp_flank_bases = 0;        // Experimental aligned-query flank length; zero disables.
   std::map<std::string, std::string> model_paths;
   std::vector<Tier> tiers;
   unsigned threads = 1, min_support = 5, polish_support = 5;
@@ -26,6 +29,8 @@ struct Options {
   unsigned end_support = 5;
   size_t max_end_extension = 10000;
   bool experiment_mean = false, ambiguous_fallback = true;
+  bool retain_higher_unique = false; // Experimental additive unique-qualified fallback.
+  bool consistent_ambiguous = false; // Experimental bounded same-tier borrowing.
   bool region = false;
   uint32_t region_tig = 0;
   size_t region_begin = 0, region_end = 0, region_flank = 100000;

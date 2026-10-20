@@ -72,7 +72,15 @@ Options parse_options(int argc, char **argv) {
              "--region TIG:BEGIN-END  One tig, zero-based half-open uncompressed draft bases\n"
              "--region-flank N      Context in bases/runs (default 100000; region mode only)\n"
              "--experiment-run-mean  Diagnostic rounded-mean run caller (default: mode)\n"
+             "--experiment-consistent-ambiguous  Bounded same-tier ambiguous run evidence\n"
+             "--experiment-retain-higher-unique  Retain higher unique votes on unique-tier "
+             "fallback;\n"
+             "                        mixed run histograms use mode, not a single-tier model\n"
              "--evidence-sites FILE  Export all-tier HPC histograms at TIG RUN rows (zero-based)\n"
+             "--evidence-read-votes  Also trace per-read evidence at --evidence-sites\n"
+             "--experiment-terminal-hp-filter  Exclude unflanked query-terminal HP votes\n"
+             "--experiment-hp-flank-bases N  Require N raw query bases and adjacent HPC matches on "
+             "each side\n"
              "--evidence-exclude-reads FILE  Read IDs excluded only from diagnostic histograms\n"
              "--unique-only        Disable default fallback to multiply placed reads\n"
              "--ambiguous-fallback Pool within tiers if no unique tier qualifies (default)\n"
@@ -128,8 +136,18 @@ Options parse_options(int argc, char **argv) {
       o.polish = true;
     else if (a == "--experiment-run-mean")
       o.experiment_mean = true;
+    else if (a == "--experiment-consistent-ambiguous")
+      o.consistent_ambiguous = true;
+    else if (a == "--experiment-retain-higher-unique")
+      o.retain_higher_unique = true;
     else if (a == "--evidence-sites")
       o.evidence_sites = value();
+    else if (a == "--evidence-read-votes")
+      o.evidence_read_votes = true;
+    else if (a == "--experiment-terminal-hp-filter")
+      o.terminal_hp_filter = true;
+    else if (a == "--experiment-hp-flank-bases")
+      o.hp_flank_bases = parse_positive_integer(value());
     else if (a == "--evidence-exclude-reads")
       o.evidence_exclude_reads = value();
     else if (a == "--tier-model") {
@@ -192,12 +210,20 @@ Options parse_options(int argc, char **argv) {
   require(o.polish_fraction > 0.5, "Polishing fraction must exceed 0.5");
   require(o.model_paths.empty() || !o.experiment_mean,
           "--tier-model cannot be combined with --experiment-run-mean");
+  require(!o.retain_higher_unique || !o.experiment_mean,
+          "Additive unique experiment uses mode, not --experiment-run-mean");
+  require(!o.consistent_ambiguous ||
+              (o.ambiguous_fallback && !o.retain_higher_unique && !o.experiment_mean),
+          "Consistent ambiguous experiment requires ambiguous reads and cannot combine estimator "
+          "experiments");
   for (const auto &[label, path] : o.model_paths)
     require(std::any_of(o.tiers.begin(), o.tiers.end(),
                         [&](const auto &tier) { return tier.label == label; }),
             "Model refers to unknown tier: " + label);
   require(o.evidence_exclude_reads.empty() || !o.evidence_sites.empty(),
           "--evidence-exclude-reads requires --evidence-sites");
+  require(!o.evidence_read_votes || !o.evidence_sites.empty(),
+          "--evidence-read-votes requires --evidence-sites");
   require(
       o.evidence_sites.empty() || !o.region,
       "Evidence export uses complete template coordinates; extract a fixture instead of --region");

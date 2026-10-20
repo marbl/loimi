@@ -155,6 +155,16 @@ Each set must support a consistent offset cluster (at least three reads and
 75% of estimates within a 20-HPC-base span); the two estimates must agree
 within 20 bases. The combined cluster's lower median is used. This is a
 heuristic consistency check, not a calibrated confidence probability.
+If that whole-read method fails, a bounded fallback examines five internal
+chunks per candidate read (up to 5,000 HPC bases each). Only chunks occurring
+exactly once in the template provide anchors. At least six independent reads
+(one for sparse layouts) and 75% of informative reads must support a 20-base
+offset cluster; a distant cluster with at least half as much support is rejected.
+Each read counts once, regardless of how many chunks match. At least three
+supporting reads (one for sparse layouts) must also pass full predicted-overlap
+alignment, with free overhangs at template boundaries. This rescues short
+templates enclosed by much longer reads without relaxing the normal fast path.
+It is conservative: noisy reads without exact internal anchors may still fail.
 Unresolved tigs fail explicitly. Reads crossing the inferred template boundary
 are aligned semi-globally to their overlapping HPC template interval. Overhangs
 are clipped at aligned run boundaries and represented as soft clips in CRAM;
@@ -165,7 +175,9 @@ produce `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
 (the adjacent clipped base is identical), that partial run cannot vote for a
 run length. The old global `--template-offset` option has been removed.
 `PREFIX.template-offsets.tsv` records offsets, attempts, placements, validation
-support, tolerance, and method (`VALIDATED`, `SPARSE`, or `SINGLE_READ`).
+support, tolerance, and method (`VALIDATED`, `SPARSE`, `INTERNAL_OVERLAP`,
+or `SINGLE_READ`). For `INTERNAL_OVERLAP`, placements count supporting reads and
+validation support counts successful overlap alignments, not held-out reads.
 With fewer than six eligible reads in a multi-read tig, every eligible read is
 aligned and the available unique placements are clustered without held-out
 validation. At least one placement is required; inconsistent estimates still
@@ -245,6 +257,17 @@ support and fraction thresholds. If both strands span the event in that tier,
 both must support it. Terminal events, pure run-length changes, overlapping or
 adjacent accepted edits, and alternate alleles containing N are excluded.
 There is one correction pass, not iterative polishing.
+
+Before voting, linked changes on a single read are combined when independently
+left-normalizing a later change would reach or cross an earlier raw event.
+The combined replacement preserves the original intervening matches and allele
+order, then is trimmed and normalized as one haplotype. For example, two
+insertions representing one `CTATT` insertion can now supply one vote instead
+of being rejected as conflicting edits at the same coordinate. Pieces from
+different reads are never joined. Unlinked nearby changes remain independent;
+this is not an unrestricted window haplotype assembler. Existing tier priority,
+90% allele fraction, strand checks, 500-base event cap and pure-HP exclusion
+still apply to the combined allele. Residual conflicts remain excluded.
 
 ### Coverage-supported end recovery
 
@@ -531,3 +554,24 @@ with no changed run lengths elsewhere in the ~11-Mb fixture. The remaining
 errors include an existing long-run disagreement and a terminal-read tie
 exposed by removing bad evidence. This is a regional validation, not a new
 whole-chromosome QV measurement or cross-technology benchmark.
+# Experimental same-tier ambiguous borrowing
+
+`--experiment-consistent-ambiguous` allows bounded ambiguous evidence to refine
+an uncertain, qualifying unique homopolymer call from the **same tier**. The
+default remains unchanged. It never combines technology-specific models across
+tiers and does not change the non-HPC polishing voting policy.
+
+Calls with model likelihood odds at least 100:1 (or 90% modal support without an
+applicable model) are protected. Otherwise, at least five ambiguous observations
+are required; their independently called length must be within 20-fold of the
+best unique likelihood (or have at least 20% unique support without a model).
+Their effective weight is capped at five observations and half the unique depth.
+Changed calls are marked `UNIQUE_BORROWED`; unique depth/peak remain the original
+unique evidence statistics. The headerless `.borrowing.tsv` audit columns are
+`tig run base tier unique_depth ambiguous_depth before after` (zero-based run).
+Sparse uncertain-run histograms are retained until that tier's ambiguous pass;
+this adds memory proportional to uncertain runs, not a dense per-tier matrix.
+
+This experiment cannot be combined with `--unique-only`,
+`--experiment-retain-higher-unique`, or `--experiment-run-mean`. Its thresholds
+are experimental, not a guarantee of accuracy across chemistries or assemblies.

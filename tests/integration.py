@@ -268,6 +268,15 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
     check_tier_policy("sparse-first", [("LA",1,1,2),("LAO",2,2,3)], 2,"LA",2,"POOLED")
     check_tier_policy("unique-sparse", [("LA",1,5,2),("LAO",4,4,3)], 2,"LA",1,"UNIQUE", ["--unique-only"])
     check_tier_policy("unique-only-next", [("LA",4,5,2),("LAO",5,4,3)], 3,"LAO",5,"UNIQUE", ["--unique-only"])
+    check_tier_policy("borrow-confident", [("LA",5,8,2),("LAO",5,0,3)], 2,"LA",5,"UNIQUE", ["--experiment-consistent-ambiguous"])
+    check_tier_policy("borrow-pooled", [("LA",2,3,2),("LAO",4,4,3)], 2,"LA",5,"POOLED", ["--experiment-consistent-ambiguous"])
+    additive = ["--experiment-retain-higher-unique"]
+    check_tier_policy("additive-next", [("LA",4,6,2),("LAO",5,0,3)], 3,"LAO",9,"UNIQUE_ADDITIVE", additive)
+    check_tier_policy("additive-third", [("LA",2,8,2),("LAO",4,0,2),("UL",5,0,4)], 2,"UL",11,"UNIQUE_ADDITIVE", additive)
+    check_tier_policy("additive-unique-only", [("LA",4,5,2),("LAO",5,4,3)], 3,"LAO",9,"UNIQUE_ADDITIVE", additive+["--unique-only"])
+    check_tier_policy("additive-first", [("LA",5,0,2),("LAO",8,0,3)], 2,"LA",5,"UNIQUE", additive)
+    check_tier_policy("additive-pooled-unchanged", [("LA",2,3,2),("LAO",4,4,3)], 2,"LA",5,"POOLED", additive)
+    check_tier_policy("additive-sparse-unchanged", [("LA",1,0,2),("LAO",4,0,3)], 2,"LA",1,"UNIQUE", additive+["--unique-only"])
     # Calibration sees combined depth five, not two separate subthreshold
     # histograms, and uses the winning tier's model only.
     pooled_rows = ["HPC_RUN_MODEL_V1 20 5"]
@@ -276,6 +285,10 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
         weights[5 if length == 6 else (4 if length == 5 else length)] = 100.0
         pooled_rows.append(f"G {length} 100 " + " ".join(str(x/sum(weights)) for x in weights))
     (root / "pooled.model").write_text("\n".join(pooled_rows) + "\n")
+    check_tier_policy("additive-no-mixed-model", [("LA",1,0,2),("LAO",5,0,5)], 5,"LAO",6,"UNIQUE_ADDITIVE",
+                      additive+["--tier-model", f"LAO={root / 'pooled.model'}"])
+    check_tier_policy("additive-pure-model", [("LA",5,0,5),("LAO",5,0,2)], 6,"LA",5,"UNIQUE",
+                      additive+["--tier-model", f"LA={root / 'pooled.model'}"])
     check_tier_policy("pooled-model", [("LA",2,3,5),("LAO",4,0,3)], 6,"LA",5,"POOLED",
                       ["--tier-model", f"LA={root / 'pooled.model'}"])
     check_tier_policy("model-lower-unique", [("LA",2,3,5),("LAO",5,0,3)], 3,"LAO",5,"UNIQUE",

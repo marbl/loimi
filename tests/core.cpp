@@ -2,6 +2,7 @@
 // Small deterministic contracts for coordinate transforms, evidence selection,
 // and packed traces. Throwing checks remain active in Release builds (unlike assert).
 #include "core.hpp"
+#include "offsets.hpp"
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
@@ -13,6 +14,40 @@ static void check(bool v, const char *msg) {
     throw std::runtime_error(msg);
 }
 int main() {
+  {
+    std::mt19937 rng(913);
+    std::string sequence;
+    for (size_t i = 0; i < 12000; ++i) {
+      char b;
+      do {
+        b = "ACGT"[rng() % 4];
+      } while (!sequence.empty() && sequence.back() == b);
+      sequence += b;
+    }
+    auto reference = sequence.substr(3000, 6000);
+    auto anchors = internal_offsets(sequence, reference, 100);
+    check(!anchors.empty() &&
+              std::all_of(anchors.begin(), anchors.end(), [](int64_t x) { return x == 3100; }),
+          "Internal anchors recover template enclosed by read");
+    check(internal_offsets(sequence, reference + reference, 100).empty(),
+          "Repeated exact chunks cannot anchor offsets");
+    check(internal_offset_cluster(
+              {{3100, 3101}, {3100}, {3099}, {3102}, {3100}, {3101}, {8000}, {}}, 6) == 3100,
+          "One-read-one-vote dominant cluster");
+    for (auto evidence : std::vector<std::vector<std::vector<int64_t>>>{
+             {{1, 1, 1, 1, 1, 1}},
+             {{1}, {1}, {1}, {100}, {100}, {100}},
+             {{1, 100}, {1, 100}, {1, 100}, {1, 100}, {1, 100}, {1, 100}}}) {
+      bool rejected = false;
+      try {
+        (void)internal_offset_cluster(evidence, 6);
+      } catch (const std::runtime_error &) {
+        rejected = true;
+      }
+      check(rejected, "Reject insufficient independent reads or competing repeat offsets");
+    }
+    check(internal_offset_cluster({{-500}}, 1) == -500, "Signed sparse offset");
+  }
   {
     std::string interior;
     for (int i = 0; i < 50; ++i)

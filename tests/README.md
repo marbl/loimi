@@ -81,6 +81,12 @@ intervals, numeric parsing and FASTA wrapping. Checks stay enabled in Release.
 Worker tests verify exactly-once execution and joined propagation of allocation
 failures. Sanitizer builds are described in `../MAINTAINING.md`.
 
+`linked-events` checks equivalent split/contiguous CIGAR representations,
+combined allele size limits, rejection of synthetic haplotypes assembled from
+different reads, and 2,000 deterministic randomized trace-to-sequence roundtrips.
+It verifies that jointly normalizing linked events preserves the actual read
+sequence, including packed traces, substitutions, insertions and deletions.
+
 `compare_versions.py` accepts two executables and common native input arguments.
 It compares all generated text artifacts and decoded CRAM records, retaining
 timing logs and a JSON report in a new directory. See `../MAINTAINING.md` for
@@ -89,3 +95,47 @@ usage, module boundaries, coordinate contracts and benchmarking cautions.
 Both biological end directions have synthetic regressions: molecule-count
 support, reverse orientation, automatic/explicit/disabled extension, side flags,
 internal regional boundaries and CRAM NM/MD validation.
+
+## Optional matched-read graph diagnostic
+
+Configure with `-DHPC_BUILD_GRAPH_PROBE=ON` to build `hp-graph-probe` and enable
+its synthetic `graph-probe` CTest. This requires installed Boost headers; pass
+`-DHPC_BOOST_INCLUDE_DIR=/path/to/include` if needed. The target compiles the
+actual external Verkko `AlnGraphBoost.C`, without modifying or relicensing it.
+The production executable does not link this graph implementation.
+
+Usage: `hp-graph-probe reference.txt reads.tsv run_begin run_end`. The reference
+is a single uppercase sequence; each TSV row is `NAME TIER ORIENTED_SEQUENCE`
+with diagnostic tiers LA/UL/LAO. Inputs must already be unique, fully spanning
+read chunks with distinct names. Run coordinates are zero-based, half-open.
+Use small local windows, not chromosome-length sequences. The output records
+per-read HPC/raw evidence, selected read IDs, and local graph sequences.
+
+The probe compares exclusive fallback with additive fallback that keeps every
+higher-priority unique read. Qualification remains five reads in the fallback
+tier, not five cumulatively. It also emits all-unique and LA+LAO mixture controls.
+Every estimator within a policy uses the same HPC-eligible read IDs. Raw alleles
+with interrupted or mismatching immediate flanks are reported, not silently
+classified as clean runs. Graph inputs retain those reads.
+
+This is not a complete utgcns replay: it uses fixed local read chunks and a fixed
+raw template, one graph round, no whole-read promotion, and no ambiguous reads.
+Its results isolate local evidence/algorithm differences but cannot establish
+which reads contributed to a separately generated mature consensus. Never
+interpret truth-selected diagnostic loci as genome-wide QV validation.
+# Bounded borrowing regression coverage
+
+The `core` tests also cover internal offset anchors, repeated-template rejection,
+one-read-one-vote clustering, competing clusters, and signed sparse offsets.
+`native-offset` generates a native package whose reads overhang both template
+ends and checks recovery in full-tig and region modes with `--no-extend-ends`.
+Neither test needs external genome data.
+
+`borrow` checks unmodeled confidence protection and bounded ambiguous support.
+`native-borrow` builds a synthetic native cnspack and checks that the opt-in
+policy changes an uncertain run while the default retains its original call.
+`apply-borrow` is a histogram driver for independent Python/C++ parity checks;
+it is not a biological quality benchmark. Biological paired runs must compare
+polished outputs on common aligned reference spans, with mixed-evidence masks
+selected without truth alleles. A single-haplotype truth does not measure phase
+switches.

@@ -9,6 +9,38 @@
 #include <tuple>
 
 namespace hpc {
+namespace {
+// Canonicalize a complete read-supported replacement, not independent pieces
+// of a haplotype. Trim shared sequence before left-normalizing a pure indel.
+Edit normalize(Edit e, const std::string &ref) {
+  while (e.end > e.begin && !e.alt.empty() && ref[e.end - 1] == e.alt.back()) {
+    --e.end;
+    e.alt.pop_back();
+  }
+  size_t shared = 0;
+  while (e.begin + shared < e.end && shared < e.alt.size() &&
+         ref[e.begin + shared] == e.alt[shared])
+    ++shared;
+  e.begin += shared;
+  e.alt.erase(0, shared);
+  if (e.begin == e.end && !e.alt.empty()) {
+    size_t shift = 0;
+    while (e.begin && ref[e.begin - 1] == e.alt[e.alt.size() - 1 - shift]) {
+      shift = (shift + 1) % e.alt.size();
+      --e.begin;
+      --e.end;
+    }
+    if (shift)
+      std::rotate(e.alt.begin(), e.alt.end() - shift, e.alt.end());
+  } else if (e.alt.empty()) {
+    while (e.begin && e.end > e.begin && ref[e.begin - 1] == ref[e.end - 1]) {
+      --e.begin;
+      --e.end;
+    }
+  }
+  return e;
+}
+} // namespace
 bool Edit::operator<(const Edit &o) const {
   return std::tie(begin, end, alt) < std::tie(o.begin, o.end, o.alt);
 }
@@ -40,13 +72,17 @@ bool crop_alignment(Alignment &a, size_t begin, size_t end) {
   return true;
 }
 std::vector<Edit> events(const Alignment &a, const std::string &ref) {
-  // Coalesce consecutive non-matches into a single replacement allele. This
-  // allows substitutions, indels, and combined events to use one voting policy.
+  // Preserve raw alignment order while grouping linked changes. Independently
+  // left-normalizing two insertions can move both to the same coordinate and
+  // falsely turn one supported haplotype into competing alleles.
   std::string expanded;
   if (a.packed_ops)
     expanded = expand_cigar(a.ops);
   const auto &ops = a.packed_ops ? expanded : a.ops;
-  std::vector<Edit> out;
+  struct Linked {
+    Edit raw, normalized;
+  };
+  std::vector<Linked> linked;
   size_t q = a.clip_left, r = a.begin;
   for (size_t i = 0; i < ops.size();) {
     if (ops[i] == '=') {
@@ -64,39 +100,44 @@ std::vector<Edit> events(const Alignment &a, const std::string &ref) {
         ++r;
     }
     e.end = r;
-    // Normalize pure indels by rotating their repeat sequence to the left.
-    if (e.begin == e.end) {
-      // Track the rotation without allocating a new allele for every shifted
-      // base. This matters in long tandem repeats; rotate only once at the end.
-      size_t shift = 0;
-      while (e.begin > 0 && !e.alt.empty() && ref[e.begin - 1] == e.alt[e.alt.size() - 1 - shift]) {
-        shift = (shift + 1) % e.alt.size();
-        --e.begin;
-        --e.end;
-      }
-      if (shift)
-        std::rotate(e.alt.begin(), e.alt.end() - shift, e.alt.end());
-    } else if (e.alt.empty()) {
-      while (e.begin > 0 && ref[e.begin - 1] == ref[e.end - 1]) {
-        --e.begin;
-        --e.end;
-      }
+    auto canonical = normalize(e, ref);
+    // Merge only when normalization reaches/crosses an earlier raw event, not
+    // merely because two independent variants are nearby. Include the original
+    // intervening matches, retaining the read's actual haplotype and order.
+    // Recheck the stack: normalization of a compound can reach another event.
+    while (!linked.empty() && canonical.begin <= linked.back().raw.end) {
+      auto previous = std::move(linked.back().raw);
+      linked.pop_back();
+      previous.alt.append(ref, previous.end, e.begin - previous.end);
+      previous.alt += e.alt;
+      previous.end = e.end;
+      e = std::move(previous);
+      canonical = normalize(e, ref);
     }
-    out.push_back(e);
+    linked.push_back({std::move(e), std::move(canonical)});
   }
   if (q + a.clip_right != a.bases().size() || r != a.end)
     throw std::runtime_error("Invalid alignment trace");
+  std::vector<Edit> out;
+  out.reserve(linked.size());
+  for (auto &group : linked)
+    if (group.normalized.begin != group.normalized.end || !group.normalized.alt.empty())
+      out.push_back(std::move(group.normalized));
   return out;
 }
 std::vector<Accepted> polish(const std::string &ref, const std::vector<Alignment> &alns, size_t nt,
-                             uint32_t support, double fraction, size_t max_indel) {
+                             uint32_t support, double fraction, size_t max_indel,
+                             size_t retain_unique_tiers) {
   std::vector<const Alignment *> ptrs;
   for (auto &a : alns)
     ptrs.push_back(&a);
-  return polish(ref, ptrs, nt, support, fraction, max_indel);
+  return polish(ref, ptrs, nt, support, fraction, max_indel, retain_unique_tiers);
 }
 std::vector<Accepted> polish(const std::string &ref, const std::vector<const Alignment *> &alns,
-                             size_t nt, uint32_t support, double fraction, size_t max_indel) {
+                             size_t nt, uint32_t support, double fraction, size_t max_indel,
+                             size_t retain_unique_tiers) {
+  if (retain_unique_tiers > nt)
+    throw std::runtime_error("Unique tier count exceeds polishing tier count");
   // Filter before inserting into tree/set storage. Homopolymer noise must not
   // inflate the chromosome-wide candidate collection only to be discarded later.
   std::map<Edit, std::set<size_t>> candidates;
@@ -166,6 +207,17 @@ std::vector<Accepted> polish(const std::string &ref, const std::vector<const Ali
     }
     for (size_t t = 0; t < nt; ++t)
       if (depth[t] >= support) {
+        // Select with this tier's depth first; never qualify by accumulating
+        // weak tiers. Retained higher unique evidence can support OR veto.
+        if (t < retain_unique_tiers)
+          for (size_t higher = 0; higher < t; ++higher) {
+            depth[t] += depth[higher];
+            votes[t] += votes[higher];
+            forward[t] += forward[higher];
+            reverse[t] += reverse[higher];
+            vf[t] += vf[higher];
+            vr[t] += vr[higher];
+          }
         // Once a tier supplies sufficient depth, disagreement there vetoes the
         // candidate; do not shop lower tiers for a more favorable allele fraction.
         if (votes[t] >= support && double(votes[t]) / depth[t] >= fraction &&

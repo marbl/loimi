@@ -1,6 +1,6 @@
 # Design status and implementation guide
 
-Updated: 2026-10-14
+Updated: 2026-10-15
 
 This file includes the original 2026-10-02 proposal below for rationale and
 research context. It is historical: where it conflicts with this status section,
@@ -71,6 +71,11 @@ behavior. Proposed options and guarantees below are not automatically supported.
 - Correction and CRAM are independent opt-ins. Correction defaults to at least
   five supporting reads, 90% allele fraction, and a 500-base maximum event.
   It excludes pure run-length changes and conflicting/adjacent edits.
+  Before voting, normalization-linked events from one read are composed in
+  original alignment order and normalized jointly. This prevents pieces of one
+  haplotype from becoming conflicting alternatives at the same coordinate.
+  It is not a general local-window assembler; unlinked changes stay separate,
+  and the original voting/strand/size/HP-exclusion policies remain unchanged.
   Additional stability/margin checks described below remain proposals.
 - Raw repair currently realigns the complete affected read interval, not only
   small local blocks. samtools performs CRAM sort/index/validation; the module

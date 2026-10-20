@@ -81,6 +81,9 @@ python3 tests/compare_versions.py \
 
 ## Performance and memory
 
+Measured before/after results and verification scope are recorded in
+[`tests/maintenance-results.md`](tests/maintenance-results.md).
+
 Measure sequential runs with identical Release compiler settings, input, model,
 options and thread count. Repeat and alternate order for small differences;
 filesystem cache and concurrent work can dominate short tests. Keep wall time,
@@ -106,3 +109,12 @@ multi-allelic/low-depth evidence, diagnostic output, and raw edlib realignment.
 Replacing whole-read realignment with local windows or changing alignment ties
 could affect QV and is not part of this behavior-preserving pass. Full-chromosome
 performance and quality must still be verified on the target machine.
+# Experimental policy boundaries
+
+Keep new consensus policies opt-in and outside the default estimator. The
+borrowing implementation is isolated in `src/experiments/borrowing.cpp`; the
+local graph remains a separately enabled diagnostic executable. Reproduction,
+limitations, and explicit removal instructions are in
+[experiments/README.md](experiments/README.md). Do not promote a diagnostic
+improvement to default behavior without paired biological validation and
+unchanged-control checks, including datasets without LAO.

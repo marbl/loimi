@@ -95,7 +95,9 @@ internal regional boundaries and CRAM NM/MD validation.
 short-anchor rejection, repeated-template rejection, signed offsets,
 coordinate-constrained rejection of a wrong origin, local coordinate
 uncertainty, cross-tier sparse support, UUID deduplication, and rejection of
-equally supported distant candidates.
+equally supported distant candidates. Tier-selection regressions cover split,
+tied, and insufficiently corroborated higher tiers falling through, while a
+decisive higher tier still wins over more numerous lower-tier observations.
 `native-offset` generates a single native package containing four tigs with
 reads overhanging both template ends. The second has five agreeing reads,
 one offset outlier, and one uninformative read; the third has no unique reads.

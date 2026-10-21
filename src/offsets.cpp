@@ -306,44 +306,43 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
   // samples already can. Keep the existing minimum unchanged for every other
   // sample size; tier agreement and competing-candidate checks still apply.
   size_t required = std::min<size_t>(3, molecules.size() / 2 + 1);
-  // Compare ordered tiers, using unique support only to resolve an equal total
-  // within a tier. Lower technologies confirm, rather than swamp, higher ones.
-  auto compare = [&](size_t a, size_t b) {
-    for (auto tier : tiers) {
+  size_t total = 0;
+  for (auto [tier, count] : informative)
+    total += count;
+  std::ostringstream rejected;
+  // Decide within one tier at a time. A higher tier with split, tied, or
+  // insufficiently corroborated evidence cannot veto a decisive lower tier.
+  // Cross-tier support is used only for the independent-molecule minimum:
+  // lower-tier abundance never overrides a qualifying higher-tier decision.
+  for (auto tier : tiers) {
+    if (!informative[tier])
+      continue;
+    auto compare = [&](size_t a, size_t b) {
       if (votes[tier][a] != votes[tier][b])
         return votes[tier][a] > votes[tier][b] ? 1 : -1;
       if (unique_votes[tier][a] != unique_votes[tier][b])
         return unique_votes[tier][a] > unique_votes[tier][b] ? 1 : -1;
-    }
-    return 0;
-  };
-  size_t best = 0;
-  for (size_t i = 1; i < n; ++i)
-    if (compare(i, best) > 0)
-      best = i;
-  size_t runner = 0;
-  bool tied = false;
-  for (size_t i = 0; i < n; ++i)
-    if (i != best && std::abs(candidates[i] - candidates[best]) > 2 * offset_local_span) {
-      runner = std::max(runner, support[i]);
-      tied |= compare(i, best) == 0;
-    }
-  bool majority = false;
-  for (auto tier : tiers)
-    if (votes[tier][best]) {
-      majority = votes[tier][best] * 5 >= informative[tier] * 3;
-      break;
-    }
-  if (support[best] < required || tied || !majority) {
-    std::ostringstream error;
-    error << "Joint offset unresolved: candidate=" << candidates[best]
-          << " support=" << support[best] << " required=" << required << " runner_up=" << runner
-          << " tied=" << tied << " majority=" << majority;
-    throw std::runtime_error(error.str());
+      return 0;
+    };
+    size_t best = 0;
+    for (size_t i = 1; i < n; ++i)
+      if (compare(i, best) > 0)
+        best = i;
+    size_t runner = 0;
+    bool tied = false;
+    for (size_t i = 0; i < n; ++i)
+      if (i != best && std::abs(candidates[i] - candidates[best]) > 2 * offset_local_span) {
+        runner = std::max(runner, support[i]);
+        tied |= compare(i, best) == 0;
+      }
+    bool majority = votes[tier][best] * 5 >= informative[tier] * 3;
+    if (support[best] >= required && majority && !tied)
+      return {candidates[best], support[best], total, runner, tier};
+    rejected << " tier=" << tier << " candidate=" << candidates[best]
+             << " tier_support=" << votes[tier][best] << "/" << informative[tier]
+             << " support=" << support[best] << " required=" << required << " runner_up=" << runner
+             << " tied=" << tied << " majority=" << majority << ";";
   }
-  size_t total = 0;
-  for (auto [tier, count] : informative)
-    total += count;
-  return {candidates[best], support[best], total, runner};
+  throw std::runtime_error("Joint offset unresolved:" + rejected.str());
 }
 } // namespace hpc

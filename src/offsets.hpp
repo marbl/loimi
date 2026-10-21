@@ -25,6 +25,7 @@ struct OffsetEvidence {
 struct OffsetChoice {
   int64_t value = 0;
   size_t support = 0, informative = 0, runner_up = 0;
+  int tier = -1; // first decisive tier; lower tiers cannot override it
 };
 // Failure-only joint inference. Scores refer to a fixed predicted query window;
 // an alignment cannot search another repeat copy. Invalid/nonoverlapping scores
@@ -48,7 +49,8 @@ OffsetScore score_offset_overlap(const std::string &query, const std::string &re
                                  double max_error);
 // Lower tiers corroborate higher-tier candidates. One molecule votes only in
 // its highest usable tier; repeated placements and corrected/raw UUID aliases
-// cannot increase independent support. Throws on insufficient or tied evidence.
+// cannot increase independent support. Inconclusive tiers fall through; throws
+// if no tier has sufficient corroboration, majority support and a resolved locus.
 OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
                                  const std::vector<OffsetRow> &rows);
 // Stable bounded sampling shared by whole-tig and region planning.

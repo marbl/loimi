@@ -190,13 +190,18 @@ Repeated IDs and recognized `hifi_UUID` / `ont_UUID` corrected/raw pairs count
 once; other names use their packaged IDs, without guessing biological aliases.
 The comparison cost is edit fraction plus `0.01 * (1 - overlap / longest_overlap)`
 to avoid rewarding tiny perfect overlaps. Candidates within 0.001 of a
-molecule's best cost share its support. Candidate support is compared in tier
-order, with unique support breaking an equal count within a tier. Lower tiers
-can corroborate but cannot overwhelm higher-tier support. A candidate requires
+molecule's best cost share its support. Each tier is evaluated independently in
+user order, with unique support breaking an equal count within that tier.
+The first decisive tier wins: its leading candidate must meet the independent
+molecule minimum, have at least 60% of that tier's informative molecules, and
+have no equally supported distant candidate in that tier. A split, tied, or
+insufficiently corroborated tier falls through to the next tier. Lower tiers
+can corroborate or resolve an inconclusive higher tier, but cannot override a
+decisive higher tier. A candidate requires
 one molecule for a one-molecule sample, two for samples of two or three, and
-three for larger samples (`min(3, n / 2 + 1)`), plus 60% support
-among informative molecules in its first supporting tier, and no equally
-supported distant candidate. Nearby representatives within 512 HPC bases are
+three for larger samples (`min(3, n / 2 + 1)`), counting independent support
+across tiers. The selected tier is reported in the rescue log. Nearby
+representatives within 512 HPC bases are
 treated as local coordinate uncertainty, not competing repeat copies.
 These are heuristic consistency checks, not calibrated confidence probabilities;
 consensus tier voting and MAPQ are unchanged. Region mode rereads the

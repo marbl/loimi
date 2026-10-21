@@ -57,13 +57,13 @@ int main() {
     for (size_t supporters = 1; supporters <= n; ++supporters) {
       std::vector<OffsetRow> rows;
       for (size_t i = 0; i < n; ++i)
-        rows.push_back({std::to_string(i), i < supporters ? 0 : 1, true,
-                        i < supporters ? std::vector<OffsetScore>{{10000, 5}, {}}
-                                       : std::vector<OffsetScore>{{}, {10000, 5}}});
+        rows.push_back(
+            {std::to_string(i), i < supporters ? 0 : 1, true,
+             i < supporters ? std::vector<OffsetScore>{{10000, 5}} : std::vector<OffsetScore>{{}}});
       bool accepted = false;
       OffsetChoice result;
       try {
-        result = choose_joint_offset({3000, 36000}, rows);
+        result = choose_joint_offset({3000}, rows);
         accepted = true;
       } catch (const std::runtime_error &) {
       }
@@ -87,6 +87,39 @@ int main() {
     joint_tie = true;
   }
   check(joint_tie);
+  // Partition 026/tig74: a split higher tier is not decisive even when its
+  // unique-support tie break favors the wrong candidate. UL can resolve it.
+  std::vector<OffsetRow> tier_rows = {{"lao1", 0, true, {{10000, 5}, {}}},
+                                      {"lao2", 0, false, {{}, {10000, 5}}}};
+  for (size_t i = 0; i < 8; ++i)
+    tier_rows.push_back({"ul" + std::to_string(i), 1, true, {{}, {10000, 5}}});
+  joint = choose_joint_offset({-810, 59199}, tier_rows);
+  check(joint.value == 59199 && joint.support == 9 && joint.tier == 1);
+  // A decisive higher tier still wins even against many lower-tier reads.
+  tier_rows.push_back({"lao3", 0, true, {{10000, 5}, {}}});
+  tier_rows.push_back({"lao4", 0, true, {{10000, 5}, {}}});
+  joint = choose_joint_offset({-810, 59199}, tier_rows);
+  check(joint.value == -810 && joint.support == 3 && joint.tier == 0);
+  // A higher-tier 100% vote from one uncorroborated molecule is insufficient.
+  joint = choose_joint_offset({3000, 36000}, {{"a", 0, true, {{10000, 5}, {}}},
+                                              {"b", 1, true, {{}, {10000, 5}}},
+                                              {"c", 1, true, {{}, {10000, 5}}},
+                                              {"d", 1, true, {{}, {10000, 5}}}});
+  check(joint.value == 36000 && joint.tier == 1);
+  // A higher tier can also be inconclusive because every read supports both
+  // loci. Lower-tier resolution is allowed; unresolved ties must still fail.
+  tier_rows = {{"a", 0, true, {{10000, 5}, {10000, 5}}},
+               {"b", 0, true, {{10000, 5}, {10000, 5}}},
+               {"c", 1, true, {{}, {10000, 5}}}};
+  check(choose_joint_offset({3000, 36000}, tier_rows).tier == 1);
+  tier_rows.push_back({"d", 1, true, {{10000, 5}, {}}});
+  bool tiers_unresolved = false;
+  try {
+    (void)choose_joint_offset({3000, 36000}, tier_rows);
+  } catch (const std::runtime_error &) {
+    tiers_unresolved = true;
+  }
+  check(tiers_unresolved);
   // Five independent supporters and one outlier satisfy the 75% rule.
   check(internal_offset_cluster({{3100, 3101}, {3100}, {3099}, {3102}, {3100}, {8000}}, 3) == 3100);
   check(internal_offset_cluster({{-500}}, 1) == -500);

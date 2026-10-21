@@ -298,7 +298,7 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
     out.placed = out.validated = choice.support;
     std::cerr << "offset joint rescue: offset=" << choice.value << " support=" << choice.support
               << " informative=" << choice.informative << " runner_up=" << choice.runner_up
-              << " candidates=" << candidates.size() << '\n';
+              << " candidates=" << candidates.size() << " tier=" << choice.tier << '\n';
     return out;
   } catch (const std::runtime_error &e) {
     std::cerr << "offset joint rescue: " << e.what() << '\n';

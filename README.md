@@ -166,23 +166,39 @@ three supporting reads (one for sparse layouts) must also pass predicted-overlap
 alignment, allowing overhangs at template ends. Noisy reads without exact
 internal anchors may still fail.
 
-If these unique-read paths fail, a final `LAYOUT_OVERLAP` rescue tries each
+If these unique-read paths fail, a final `LAYOUT_OVERLAP` rescue samples each
 user-ordered tier, using a deterministic sample of up to 64 distinct read IDs
 per tier. Known non-unique placements are allowed for coordinate inference;
 this does not promote their consensus votes or MAPQ. The shorter of the read
 and template is aligned inside the longer. Failed partial overlaps can instead
 use up to 64 internal chunks (up to 2,000 HPC bases), requiring separated,
-collinear matches that occur once in the template. Tied whole alignments and
-anchors shorter than 128 HPC bases are rejected.
+collinear matches that occur once in the template. Tied alignments at distant
+loci and anchors shorter than 128 HPC bases are rejected. Local optimal
+endpoints within 256 HPC bases describe one uncertain locus. Noisy matches
+pinned to either sequence boundary are checked with internal anchors instead
+of assuming they represent a complete overlap.
 
-Within each tier the rescue tries unique evidence first, then all known
-placements. Each ID counts once. A candidate needs at least three supporting
-IDs (or all available IDs if fewer than three), at least 60% of informative
-IDs, and strictly more than twice the support of a distant competitor. Strong
-conflicting unique evidence vetoes a pooled candidate. Supporting reads must
-also pass predicted-overlap alignment (at least three, or all available IDs
-if fewer, and at least 60% of candidate supporters). These are consistency
-checks, not calibrated confidence probabilities. Region mode rereads the
+The rescue evaluates shared candidates against all sampled reads, allowing
+lower tiers to corroborate a higher-tier origin. Local proposals are grouped
+within 256 HPC bases and represented by the per-ID lower median in the highest
+available tier. More than 128 candidate loci fails explicitly. Each candidate
+is scored using **global alignment of the layout-predicted query interval**;
+it cannot relocate to a different repeat copy inside an enclosing read.
+
+Each molecule contributes in its highest tier with usable overlap scores.
+Repeated IDs and recognized `hifi_UUID` / `ont_UUID` corrected/raw pairs count
+once; other names use their packaged IDs, without guessing biological aliases.
+The comparison cost is edit fraction plus `0.01 * (1 - overlap / longest_overlap)`
+to avoid rewarding tiny perfect overlaps. Candidates within 0.001 of a
+molecule's best cost share its support. Candidate support is compared in tier
+order, with unique support breaking an equal count within a tier. Lower tiers
+can corroborate but cannot overwhelm higher-tier support. A candidate requires
+three molecules (or all sampled molecules if fewer than three), 60% support
+among informative molecules in its first supporting tier, and no equally
+supported distant candidate. Nearby representatives within 512 HPC bases are
+treated as local coordinate uncertainty, not competing repeat copies.
+These are heuristic consistency checks, not calibrated confidence probabilities;
+consensus tier voting and MAPQ are unchanged. Region mode rereads the
 package with the same bounded ID sample only if its initial anchors fail.
 Unresolved offsets are never guessed.
 Unresolved tigs fail explicitly. Reads crossing the inferred template boundary
@@ -196,8 +212,10 @@ produce `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
 run length. The old global `--template-offset` option has been removed.
 `PREFIX.template-offsets.tsv` records offsets, attempts, placements, validation
 support, tolerance, and method (`VALIDATED`, `SPARSE`, `INTERNAL_OVERLAP`,
-`LAYOUT_OVERLAP`, or `SINGLE_READ`). For the overlap rescue methods, placements count supporting reads and
-validation support counts successful overlap alignments, not held-out reads.
+`LAYOUT_OVERLAP`, or `SINGLE_READ`). For `LAYOUT_OVERLAP`, placements and
+validation support count supporting molecules, and tolerance reports the
+256-HPC-base proposal span. For `INTERNAL_OVERLAP`, they count supporting reads
+and successful coordinate-constrained overlap checks, not held-out reads.
 With fewer than six eligible reads in a multi-read tig, every eligible read is
 aligned and the available unique placements are clustered without held-out
 validation. At least one placement is required; inconsistent estimates still

@@ -219,23 +219,11 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
                          [&](int64_t x) { return std::abs(x - candidate) <= 20; }))
           continue;
         auto &w = work[seeds[j]];
-        int64_t b = int64_t(w.hbegin) - candidate, e = int64_t(w.hend) - candidate;
-        auto lo = std::max<int64_t>(0, b), hi = std::min<int64_t>(ref.size(), e);
-        if (hi <= lo)
-          continue;
         auto q = encode(w.a.bases().substr(w.a.clip_left,
                                            w.a.bases().size() - w.a.clip_left - w.a.clip_right))
                      .bases;
-        try {
-          auto target = ref.substr(size_t(lo), size_t(hi - lo));
-          if (b < 0 || e > int64_t(ref.size()))
-            (void)align_boundary(q, target, b<0, e> int64_t(ref.size()), max_error);
-          else
-            (void)align(q, target, max_error);
+        if (validate_offset_overlap(q, ref, w.hbegin, w.hend, candidate, max_error))
           ++validated;
-        } catch (const std::runtime_error &) {
-          // A repeat-tied overlap is not validation, even with a unique chunk.
-        }
       }
       if (validated >= (out.sparse ? 1u : 3u)) {
         out.value = candidate;
@@ -256,16 +244,16 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
   // Final rescue: known placements from each technology, including non-unique
   // ones, can anchor the coordinate transform without gaining consensus votes.
   std::map<int, std::vector<size_t>> tiers;
-  std::set<uint32_t> known_ids;
   for (size_t i = 0; i < work.size(); ++i) {
     const auto &w = work[i];
     if ((w.reason.empty() || w.reason == "AMBIGUOUS_PLACEMENT") && w.a.tier >= 0 &&
         w.placements > 0 && !w.a.bases().empty()) {
       tiers[w.a.tier].push_back(i);
-      known_ids.insert(w.a.id);
     }
   }
-  size_t required = std::min<size_t>(3, known_ids.size());
+  std::vector<OffsetEvidence> evidence;
+  std::vector<int> evidence_tiers;
+  std::vector<size_t> selected;
   for (auto &[tier, indices] : tiers) {
     std::set<std::pair<uint64_t, uint32_t>> sample;
     for (auto i : indices) {
@@ -274,8 +262,6 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
       if (sample.size() > 64)
         sample.erase(std::prev(sample.end()));
     }
-    std::vector<OffsetEvidence> evidence;
-    std::vector<size_t> selected;
     for (auto i : indices) {
       auto &w = work[i];
       if (!sample.count({offset_sample_key(w.a.id), w.a.id}))
@@ -284,44 +270,38 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
                                          w.a.bases().size() - w.a.clip_left - w.a.clip_right))
                    .bases;
       evidence.push_back({w.a.id, w.unique, discover_offsets(q, ref, w.hbegin, max_error)});
+      evidence_tiers.push_back(tier);
       selected.push_back(i);
     }
-    // Prefer decisive unique evidence within a tier; otherwise compare all
-    // known placements. Each ID counts once and strong unique conflict vetoes.
-    for (bool only_unique : {true, false}) {
-      try {
-        auto choice = choose_offset(evidence, required, only_unique);
-        std::set<uint32_t> validated;
-        for (size_t j = 0; j < evidence.size(); ++j) {
-          auto &ev = evidence[j];
-          if ((only_unique && !ev.unique) || validated.count(ev.id) ||
-              std::none_of(ev.offsets.begin(), ev.offsets.end(),
-                           [&](int64_t x) { return std::abs(x - choice.value) <= 20; }))
-            continue;
-          auto &w = work[selected[j]];
-          auto q = encode(w.a.bases().substr(w.a.clip_left,
-                                             w.a.bases().size() - w.a.clip_left - w.a.clip_right))
-                       .bases;
-          if (validate_offset_overlap(q, ref, w.hbegin, w.hend, choice.value, max_error))
-            validated.insert(ev.id);
-        }
-        std::cerr << "offset layout rescue: tier=" << tier << " unique_only=" << only_unique
-                  << " offset=" << choice.value << " support=" << choice.support
-                  << " informative=" << choice.informative << " runner_up=" << choice.runner_up
-                  << " validated=" << validated.size() << '\n';
-        if (validated.size() < required || validated.size() * 5 < choice.support * 3)
-          continue;
-        out.value = choice.value;
-        out.layout_rescue = true;
-        out.attempted = selected.size();
-        out.placed = choice.support;
-        out.validated = validated.size();
-        return out;
-      } catch (const std::runtime_error &e) {
-        std::cerr << "offset layout rescue: tier=" << tier << " unique_only=" << only_unique << ' '
-                  << e.what() << '\n';
-      }
-    }
+  }
+  // Score the SAME candidates against every sampled placement, not just reads
+  // that proposed that candidate. This allows sparse cross-tier corroboration.
+  // Only one read's compressed sequence exists at a time; the persistent matrix
+  // is bounded by sampled placements x 128 candidate loci, not chromosome size.
+  auto candidates = offset_candidates(evidence, evidence_tiers);
+  std::vector<OffsetRow> rows;
+  for (auto i : selected) {
+    auto &w = work[i];
+    auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                       w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                 .bases;
+    OffsetRow row{offset_molecule(w.a.name, w.a.id), w.a.tier, w.unique, {}};
+    for (auto candidate : candidates)
+      row.scores.push_back(score_offset_overlap(q, ref, w.hbegin, w.hend, candidate, max_error));
+    rows.push_back(std::move(row));
+  }
+  try {
+    auto choice = choose_joint_offset(candidates, rows);
+    out.value = choice.value;
+    out.layout_rescue = true;
+    out.attempted = selected.size();
+    out.placed = out.validated = choice.support;
+    std::cerr << "offset joint rescue: offset=" << choice.value << " support=" << choice.support
+              << " informative=" << choice.informative << " runner_up=" << choice.runner_up
+              << " candidates=" << candidates.size() << '\n';
+    return out;
+  } catch (const std::runtime_error &e) {
+    std::cerr << "offset joint rescue: " << e.what() << '\n';
   }
   throw std::runtime_error("Cannot infer reliable template offset from " +
                            std::to_string(out.attempted) + " reads (" +
@@ -625,6 +605,7 @@ int main(int argc, char **argv) {
           w.hend = p->max();
           seeds.push_back(std::move(w));
         }
+        std::cerr << "tig " << t.tigID() << ": planning region offset\n";
         try {
           region_offset = infer_offset(seeds, t.length(), template_seq, o.max_error, eligible);
         } catch (const std::runtime_error &) {
@@ -790,20 +771,21 @@ int main(int argc, char **argv) {
         if (std::string_view("ACGTN").find(ref[i]) == std::string_view::npos ||
             (i && ref[i] == ref[i - 1]))
           throw std::runtime_error("Template is not homopolymer compressed: " + name);
+      std::cerr << "tig " << name << ": resolving template offset\n";
       auto inferred = o.region ? region_offset : infer_offset(work, tig.length(), ref, o.max_error);
       // Offset-only reads must not remain resident through consensus calling.
       for (auto &w : work)
         if (!w.reason.empty() && o.cram.empty())
           w.a.shared_sequence.reset();
       int64_t offset = inferred.value;
-      outputs[".template-offsets.tsv"] << name << '\t' << offset << '\t' << inferred.attempted
-                                       << '\t' << inferred.placed << '\t' << inferred.validated
-                                       << "\t20\t"
-                                       << (inferred.layout_rescue ? "LAYOUT_OVERLAP"
-                                           : inferred.internal    ? "INTERNAL_OVERLAP"
-                                           : inferred.sparse      ? "SPARSE"
-                                                                  : "VALIDATED")
-                                       << '\n';
+      outputs[".template-offsets.tsv"]
+          << name << '\t' << offset << '\t' << inferred.attempted << '\t' << inferred.placed << '\t'
+          << inferred.validated << '\t' << (inferred.layout_rescue ? offset_local_span : 20) << '\t'
+          << (inferred.layout_rescue ? "LAYOUT_OVERLAP"
+              : inferred.internal    ? "INTERNAL_OVERLAP"
+              : inferred.sparse      ? "SPARSE"
+                                     : "VALIDATED")
+          << '\n';
       std::cerr << "tig " << name << ": inferred template offset " << offset << " from "
                 << inferred.placed << " reads\n";
       for (auto &w : work)

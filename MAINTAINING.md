@@ -13,6 +13,7 @@ changing that policy.
 | `src/core.hpp` | Algorithm interfaces, coordinate conventions and ownership contracts |
 | `src/core.cpp` | RLE, alignment adapters, local HPC filtering and empirical run estimator |
 | `src/models.cpp` | Calibration file validation and likelihood estimator |
+| `src/offsets.hpp`, `src/offsets.cpp` | HPC origin anchors, repeat-aware independent-read clustering and overlap validation |
 | `src/polish.cpp` | Raw-base candidate normalization, voting, edits and alignment tags |
 | `src/ends.cpp` | Coverage-supported extension at biological template ends |
 | `src/parallel.hpp` | Bounded worker scheduling and joined exception propagation |

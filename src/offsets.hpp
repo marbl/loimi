@@ -5,6 +5,7 @@
 #include <vector>
 
 namespace hpc {
+inline constexpr int64_t offset_local_span = 256;
 // Failure-only rescue anchors in HPC coordinates. Each exact chunk must occur
 // once in the template; different chunks from one read are NOT independent votes.
 std::vector<int64_t> internal_offsets(const std::string &query, const std::string &reference,
@@ -25,17 +26,39 @@ struct OffsetChoice {
   int64_t value = 0;
   size_t support = 0, informative = 0, runner_up = 0;
 };
+// Failure-only joint inference. Scores refer to a fixed predicted query window;
+// an alignment cannot search another repeat copy. Invalid/nonoverlapping scores
+// have overlap == 0. All coordinates and lengths are HPC bases.
+struct OffsetScore {
+  size_t overlap = 0, edits = 0;
+};
+struct OffsetRow {
+  std::string molecule;
+  int tier = 0;
+  bool unique = false;
+  std::vector<OffsetScore> scores;
+};
+std::string offset_molecule(const std::string &name, uint32_t id);
+// Coalesce local coordinate uncertainty (256 HPC bases), never distant copies.
+// Each locus is represented by the median proposals from its highest tier.
+std::vector<int64_t> offset_candidates(const std::vector<OffsetEvidence> &reads,
+                                       const std::vector<int> &tiers);
+OffsetScore score_offset_overlap(const std::string &query, const std::string &reference,
+                                 int64_t layout_begin, int64_t layout_end, int64_t offset,
+                                 double max_error);
+// Lower tiers corroborate higher-tier candidates. One molecule votes only in
+// its highest usable tier; repeated placements and corrected/raw UUID aliases
+// cannot increase independent support. Throws on insufficient or tied evidence.
+OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
+                                 const std::vector<OffsetRow> &rows);
 // Stable bounded sampling shared by whole-tig and region planning.
 uint64_t offset_sample_key(uint32_t id);
-// Whole shorter-sequence alignment first; tied alignments remain unresolved.
+// Whole shorter-sequence alignment first; distant tied loci remain unresolved.
+// Optimal endpoints within a 256-base neighborhood are one uncertain locus.
 // Failed partial overlaps may use collinear, separated exact chunks, at most
 // 64 sampled positions. Coordinates and distances are HPC bases.
 std::vector<int64_t> discover_offsets(const std::string &query, const std::string &reference,
                                       int64_t layout_begin, double max_error);
-// >=60% informative molecules, strictly >2x the distant runner-up, and the
-// requested minimum independent support. Strong unique conflicts veto rescue.
-OffsetChoice choose_offset(const std::vector<OffsetEvidence> &reads, size_t required,
-                           bool unique_only = false);
 bool validate_offset_overlap(const std::string &query, const std::string &reference,
                              int64_t layout_begin, int64_t layout_end, int64_t offset,
                              double max_error);

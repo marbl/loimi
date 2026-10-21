@@ -36,33 +36,30 @@ int main() {
   check(std::find(partial.begin(), partial.end(), 3100) != partial.end());
   check(validate_offset_overlap(sequence, reference, 100, 12100, 3100, .15));
   check(!validate_offset_overlap(sequence, reference, 100, 12100, 20000, .15));
-  std::vector<OffsetEvidence> rescue;
-  for (uint32_t i = 0; i < 11; ++i)
-    rescue.push_back({i, false, {i < 8 ? 201755 : i < 10 ? 234918 : 168588}});
-  auto choice = choose_offset(rescue, 3);
-  check(choice.value == 201755 && choice.support == 8 && choice.runner_up == 2);
-  // Multiple placements of one ID are not independent confirmation.
-  for (auto evidence : std::vector<std::vector<OffsetEvidence>>{
-           {{1, false, {100}}, {1, false, {100}}, {1, false, {100}}},
-           {{1, false, {100, 200}}, {2, false, {100, 200}}, {3, false, {100, 200}}},
-           {{1, true, {200}},
-            {2, true, {200}},
-            {3, true, {200}},
-            {4, false, {100}},
-            {5, false, {100}},
-            {6, false, {100}},
-            {7, false, {100}},
-            {8, false, {100}},
-            {9, false, {100}},
-            {10, false, {100}}}}) {
-    bool rejected = false;
-    try {
-      (void)choose_offset(evidence, 3);
-    } catch (const std::runtime_error &) {
-      rejected = true;
-    }
-    check(rejected);
+  // The old free-end validator relocated this wrong origin to the right locus.
+  check(!validate_offset_overlap(sequence, reference, 100, 12100, 1000, .15));
+  const std::string uuid = "50cb72c7-194d-4194-9755-747e8f9c6e66";
+  check(offset_molecule("hifi_" + uuid, 1) == offset_molecule("ont_" + uuid, 2));
+  check(offset_molecule("hifi_m84031/1/ccs", 1) != offset_molecule("hifi_m84031/2/ccs", 2));
+  auto joint = choose_joint_offset({3000, 36000}, {{"a", 0, true, {{20000, 3}, {}}},
+                                                   {"b", 1, true, {{17000, 373}, {21000, 528}}}});
+  check(joint.value == 3000 && joint.support == 2);
+  // Sparse support can span tiers; multiple technologies cannot manufacture
+  // additional independent molecules from a corrected/raw pair.
+  joint = choose_joint_offset({3000}, {{"a", 0, true, {{10000, 5}}},
+                                       {"a", 1, true, {{10000, 10}}},
+                                       {"b", 1, false, {{10000, 20}}}});
+  check(joint.support == 2 && joint.informative == 2);
+  check(offset_candidates({{1, true, {59841}}, {2, true, {59891}}}, {0, 1}) ==
+        std::vector<int64_t>{59841});
+  bool joint_tie = false;
+  try {
+    (void)choose_joint_offset({3000, 36000}, {{"a", 0, true, {{10000, 5}, {10000, 5}}},
+                                              {"b", 1, true, {{10000, 10}, {10000, 10}}}});
+  } catch (const std::runtime_error &) {
+    joint_tie = true;
   }
+  check(joint_tie);
   // Five independent supporters and one outlier satisfy the 75% rule.
   check(internal_offset_cluster({{3100, 3101}, {3100}, {3099}, {3102}, {3100}, {8000}}, 3) == 3100);
   check(internal_offset_cluster({{-500}}, 1) == -500);

@@ -302,7 +302,10 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
   for (auto tier : tiers)
     for (size_t i = 0; i < n; ++i)
       support[i] += votes[tier][i];
-  size_t required = std::min<size_t>(3, molecules.size());
+  // A three-molecule sample may contain one outlier, just as four/five-read
+  // samples already can. Keep the existing minimum unchanged for every other
+  // sample size; tier agreement and competing-candidate checks still apply.
+  size_t required = std::min<size_t>(3, molecules.size() / 2 + 1);
   // Compare ordered tiers, using unique support only to resolve an equal total
   // within a tier. Lower technologies confirm, rather than swamp, higher ones.
   auto compare = [&](size_t a, size_t b) {

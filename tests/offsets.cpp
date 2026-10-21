@@ -44,6 +44,33 @@ int main() {
   auto joint = choose_joint_offset({3000, 36000}, {{"a", 0, true, {{20000, 3}, {}}},
                                                    {"b", 1, true, {{17000, 373}, {21000, 528}}}});
   check(joint.value == 3000 && joint.support == 2);
+  // Three-molecule sparse layout: LAO and one UL agree; another UL prefers a
+  // distant copy. Two independent supporters suffice without changing tiers.
+  joint = choose_joint_offset({1030, 66363}, {{"lao", 0, false, {{}, {30724, 52}}},
+                                              {"ul1", 1, true, {{41045, 371}, {41045, 508}}},
+                                              {"ul2", 1, true, {{}, {41045, 1696}}}});
+  check(joint.value == 66363 && joint.support == 2 && joint.informative == 3);
+  // Exercise the support boundary independently of tier/majority gates. Only
+  // n=3 changes: n=1 needs one; n=2 needs both; n>=4 still needs three.
+  const size_t minimum[] = {0, 1, 2, 2, 3, 3, 3, 3, 3};
+  for (size_t n = 1; n <= 8; ++n)
+    for (size_t supporters = 1; supporters <= n; ++supporters) {
+      std::vector<OffsetRow> rows;
+      for (size_t i = 0; i < n; ++i)
+        rows.push_back({std::to_string(i), i < supporters ? 0 : 1, true,
+                        i < supporters ? std::vector<OffsetScore>{{10000, 5}, {}}
+                                       : std::vector<OffsetScore>{{}, {10000, 5}}});
+      bool accepted = false;
+      OffsetChoice result;
+      try {
+        result = choose_joint_offset({3000, 36000}, rows);
+        accepted = true;
+      } catch (const std::runtime_error &) {
+      }
+      check(accepted == (supporters >= minimum[n]));
+      if (accepted)
+        check(result.value == 3000 && result.support == supporters);
+    }
   // Sparse support can span tiers; multiple technologies cannot manufacture
   // additional independent molecules from a corrected/raw pair.
   joint = choose_joint_offset({3000}, {{"a", 0, true, {{10000, 5}}},

@@ -193,7 +193,8 @@ to avoid rewarding tiny perfect overlaps. Candidates within 0.001 of a
 molecule's best cost share its support. Candidate support is compared in tier
 order, with unique support breaking an equal count within a tier. Lower tiers
 can corroborate but cannot overwhelm higher-tier support. A candidate requires
-three molecules (or all sampled molecules if fewer than three), 60% support
+one molecule for a one-molecule sample, two for samples of two or three, and
+three for larger samples (`min(3, n / 2 + 1)`), plus 60% support
 among informative molecules in its first supporting tier, and no equally
 supported distant candidate. Nearby representatives within 512 HPC bases are
 treated as local coordinate uncertainty, not competing repeat copies.

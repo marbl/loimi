@@ -164,7 +164,27 @@ therefore qualify; requiring six agreeing reads would defeat the outlier rule.
 A distant cluster with at least half as much support is rejected. At least
 three supporting reads (one for sparse layouts) must also pass predicted-overlap
 alignment, allowing overhangs at template ends. Noisy reads without exact
-internal anchors may still fail; unresolved offsets are never guessed.
+internal anchors may still fail.
+
+If these unique-read paths fail, a final `LAYOUT_OVERLAP` rescue tries each
+user-ordered tier, using a deterministic sample of up to 64 distinct read IDs
+per tier. Known non-unique placements are allowed for coordinate inference;
+this does not promote their consensus votes or MAPQ. The shorter of the read
+and template is aligned inside the longer. Failed partial overlaps can instead
+use up to 64 internal chunks (up to 2,000 HPC bases), requiring separated,
+collinear matches that occur once in the template. Tied whole alignments and
+anchors shorter than 128 HPC bases are rejected.
+
+Within each tier the rescue tries unique evidence first, then all known
+placements. Each ID counts once. A candidate needs at least three supporting
+IDs (or all available IDs if fewer than three), at least 60% of informative
+IDs, and strictly more than twice the support of a distant competitor. Strong
+conflicting unique evidence vetoes a pooled candidate. Supporting reads must
+also pass predicted-overlap alignment (at least three, or all available IDs
+if fewer, and at least 60% of candidate supporters). These are consistency
+checks, not calibrated confidence probabilities. Region mode rereads the
+package with the same bounded ID sample only if its initial anchors fail.
+Unresolved offsets are never guessed.
 Unresolved tigs fail explicitly. Reads crossing the inferred template boundary
 are aligned semi-globally to their overlapping HPC template interval. Overhangs
 are clipped at aligned run boundaries and represented as soft clips in CRAM;
@@ -175,8 +195,8 @@ produce `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
 (the adjacent clipped base is identical), that partial run cannot vote for a
 run length. The old global `--template-offset` option has been removed.
 `PREFIX.template-offsets.tsv` records offsets, attempts, placements, validation
-support, tolerance, and method (`VALIDATED`, `SPARSE`, `INTERNAL_OVERLAP`, or
-`SINGLE_READ`). For `INTERNAL_OVERLAP`, placements count supporting reads and
+support, tolerance, and method (`VALIDATED`, `SPARSE`, `INTERNAL_OVERLAP`,
+`LAYOUT_OVERLAP`, or `SINGLE_READ`). For the overlap rescue methods, placements count supporting reads and
 validation support counts successful overlap alignments, not held-out reads.
 With fewer than six eligible reads in a multi-read tig, every eligible read is
 aligned and the available unique placements are clustered without held-out
@@ -203,8 +223,10 @@ then-sparse selection among unique tiers. Optional non-HPC polishing retains its
 separate unique-then-ambiguous groups and polishing thresholds; its policy is not
 changed by the run-calling threshold. `--unique-only` also filters polishing for
 controlled comparisons; `--ambiguous-fallback` explicitly selects the default.
-Unknown placement counts (zero) remain export-only. Offset discovery still needs
-unique anchors; entirely ambiguous multi-read tigs are not yet supported.
+Unknown placement counts (zero) remain export-only. Entirely non-unique
+multi-read tigs can use the layout-overlap rescue when their offsets are
+unambiguous. `--unique-only` still excludes these reads from consensus votes,
+but not from offset inference.
 All distinct eligible placements are exported when CRAM is requested.
 The legacy `skipConsensus` flag is ignored:
 explicit user tiers replace its template-building priority policy. Any number

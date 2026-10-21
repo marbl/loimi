@@ -91,10 +91,12 @@ support, reverse orientation, automatic/explicit/disabled extension, side flags,
 internal regional boundaries and CRAM NM/MD validation.
 # Offset fallback regressions
 
-`offsets` checks internal exact anchors, repeated-template rejection, signed
-offsets, one-read-one-vote clustering, and rejection of competing clusters.
-`native-offset` generates a single native package containing two tigs with
+`offsets` checks internal exact anchors, whole and partial overlaps,
+short-anchor rejection, repeated-template rejection, signed offsets,
+one-ID-one-vote clustering, competing clusters, and conflicting unique evidence.
+`native-offset` generates a single native package containing three tigs with
 reads overhanging both template ends. The second has five agreeing reads,
-one offset outlier, and one uninformative read. Both full-package and region
+one offset outlier, and one uninformative read; the third has no unique reads.
+Both full-package and region
 modes must finish with `--no-extend-ends`. No external genome data is needed.
 

@@ -137,9 +137,11 @@ struct Offset {
   size_t attempted = 0, placed = 0, validated = 0;
   bool sparse = false;
   bool internal = false;
+  bool layout_rescue = false;
 };
 static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const std::string &ref,
-                           double max_error, size_t eligible_count = SIZE_MAX) {
+                           double max_error, size_t eligible_count = SIZE_MAX,
+                           bool rescue_only = false) {
   std::vector<size_t> seeds;
   for (size_t i = 0; i < work.size(); ++i)
     if (work[i].reason.empty() && work[i].unique)
@@ -153,105 +155,247 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
   Offset out;
   out.sparse = (eligible_count == SIZE_MAX ? seeds.size() : eligible_count) < 6;
   std::vector<int64_t> estimates;
-  for (size_t i : seeds) {
-    if (out.attempted == 32)
-      break;
-    ++out.attempted;
-    auto &w = work[i];
-    auto q = encode(w.a.bases().substr(w.a.clip_left,
-                                       w.a.bases().size() - w.a.clip_left - w.a.clip_right))
-                 .bases;
-    auto pos = locate(q, ref, max_error);
-    if (pos < 0)
-      continue;
-    estimates.push_back(int64_t(w.hbegin) - pos);
-    out.placed = estimates.size();
-    if (out.sparse || estimates.size() < 6)
-      continue;
-    size_t split = estimates.size() / 2;
-    try {
-      auto first = offset_cluster({estimates.begin(), estimates.begin() + split});
-      auto second = offset_cluster({estimates.begin() + split, estimates.end()});
-      if (std::abs(first - second) > 20)
+  if (!rescue_only) {
+    for (size_t i : seeds) {
+      if (out.attempted == 32)
+        break;
+      ++out.attempted;
+      auto &w = work[i];
+      auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                         w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                   .bases;
+      auto pos = locate(q, ref, max_error);
+      if (pos < 0)
         continue;
-      out.value = offset_cluster(estimates);
-      out.validated = 0;
-      for (size_t j = split; j < estimates.size(); ++j)
-        out.validated += std::abs(estimates[j] - out.value) <= 20;
-      if (out.validated >= 3)
+      estimates.push_back(int64_t(w.hbegin) - pos);
+      out.placed = estimates.size();
+      if (out.sparse || estimates.size() < 6)
+        continue;
+      size_t split = estimates.size() / 2;
+      try {
+        auto first = offset_cluster({estimates.begin(), estimates.begin() + split});
+        auto second = offset_cluster({estimates.begin() + split, estimates.end()});
+        if (std::abs(first - second) > 20)
+          continue;
+        out.value = offset_cluster(estimates);
+        out.validated = 0;
+        for (size_t j = split; j < estimates.size(); ++j)
+          out.validated += std::abs(estimates[j] - out.value) <= 20;
+        if (out.validated >= 3)
+          return out;
+      } catch (const std::runtime_error &) {
+      }
+    }
+    if (out.sparse && !estimates.empty()) {
+      try {
+        out.value = offset_cluster(estimates, 1);
         return out;
-    } catch (const std::runtime_error &) {
+      } catch (const std::runtime_error &) {
+        // Sparse layouts can also contain reads overhanging both template ends.
+      }
     }
-  }
-  if (out.sparse && !estimates.empty()) {
-    try {
-      out.value = offset_cluster(estimates, 1);
-      return out;
-    } catch (const std::runtime_error &) {
-      // Sparse layouts can also contain reads overhanging both template ends.
-    }
-  }
-  // Preserve the established fast path exactly. Only unresolved offsets use
-  // internal anchors; retain bounded scratch and count each read once.
-  std::vector<std::vector<int64_t>> anchors;
-  size_t limit = std::min<size_t>(32, seeds.size());
-  for (size_t j = 0; j < limit; ++j) {
-    auto &w = work[seeds[j]];
-    auto q = encode(w.a.bases().substr(w.a.clip_left,
-                                       w.a.bases().size() - w.a.clip_left - w.a.clip_right))
-                 .bases;
-    anchors.push_back(internal_offsets(q, ref, int64_t(w.hbegin)));
-  }
-  try {
-    // Small informative samples must tolerate the outliers allowed by the
-    // 75% agreement rule. Count independent reads, never individual chunks.
-    size_t informative = std::count_if(anchors.begin(), anchors.end(),
-                                       [](const auto &read) { return !read.empty(); });
-    size_t required =
-        out.sparse ? 1 : std::max<size_t>(3, std::min<size_t>(6, (3 * informative + 3) / 4));
-    auto candidate = internal_offset_cluster(anchors, required);
-    size_t validated = 0;
+    // Preserve the established fast path exactly. Only unresolved offsets use
+    // internal anchors; retain bounded scratch and count each read once.
+    std::vector<std::vector<int64_t>> anchors;
+    size_t limit = std::min<size_t>(32, seeds.size());
     for (size_t j = 0; j < limit; ++j) {
-      if (std::none_of(anchors[j].begin(), anchors[j].end(),
-                       [&](int64_t x) { return std::abs(x - candidate) <= 20; }))
-        continue;
       auto &w = work[seeds[j]];
-      int64_t b = int64_t(w.hbegin) - candidate, e = int64_t(w.hend) - candidate;
-      auto lo = std::max<int64_t>(0, b), hi = std::min<int64_t>(ref.size(), e);
-      if (hi <= lo)
+      auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                         w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                   .bases;
+      anchors.push_back(internal_offsets(q, ref, int64_t(w.hbegin)));
+    }
+    try {
+      // Small informative samples must tolerate the outliers allowed by the
+      // 75% agreement rule. Count independent reads, never individual chunks.
+      size_t informative = std::count_if(anchors.begin(), anchors.end(),
+                                         [](const auto &read) { return !read.empty(); });
+      size_t required =
+          out.sparse ? 1 : std::max<size_t>(3, std::min<size_t>(6, (3 * informative + 3) / 4));
+      auto candidate = internal_offset_cluster(anchors, required);
+      size_t validated = 0;
+      for (size_t j = 0; j < limit; ++j) {
+        if (std::none_of(anchors[j].begin(), anchors[j].end(),
+                         [&](int64_t x) { return std::abs(x - candidate) <= 20; }))
+          continue;
+        auto &w = work[seeds[j]];
+        int64_t b = int64_t(w.hbegin) - candidate, e = int64_t(w.hend) - candidate;
+        auto lo = std::max<int64_t>(0, b), hi = std::min<int64_t>(ref.size(), e);
+        if (hi <= lo)
+          continue;
+        auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                           w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                     .bases;
+        try {
+          auto target = ref.substr(size_t(lo), size_t(hi - lo));
+          if (b < 0 || e > int64_t(ref.size()))
+            (void)align_boundary(q, target, b<0, e> int64_t(ref.size()), max_error);
+          else
+            (void)align(q, target, max_error);
+          ++validated;
+        } catch (const std::runtime_error &) {
+          // A repeat-tied overlap is not validation, even with a unique chunk.
+        }
+      }
+      if (validated >= (out.sparse ? 1u : 3u)) {
+        out.value = candidate;
+        out.internal = true;
+        out.validated = validated;
+        out.placed = std::count_if(anchors.begin(), anchors.end(), [&](const auto &read) {
+          return std::any_of(read.begin(), read.end(),
+                             [&](int64_t x) { return std::abs(x - candidate) <= 20; });
+        });
+        std::cerr << "offset rescue: internal anchors, offset " << candidate
+                  << ", validated overlaps " << validated << '\n';
+        return out;
+      }
+    } catch (const std::runtime_error &) {
+      // Do not guess an offset when internal evidence is weak or contradictory.
+    }
+  }
+  // Final rescue: known placements from each technology, including non-unique
+  // ones, can anchor the coordinate transform without gaining consensus votes.
+  std::map<int, std::vector<size_t>> tiers;
+  std::set<uint32_t> known_ids;
+  for (size_t i = 0; i < work.size(); ++i) {
+    const auto &w = work[i];
+    if ((w.reason.empty() || w.reason == "AMBIGUOUS_PLACEMENT") && w.a.tier >= 0 &&
+        w.placements > 0 && !w.a.bases().empty()) {
+      tiers[w.a.tier].push_back(i);
+      known_ids.insert(w.a.id);
+    }
+  }
+  size_t required = std::min<size_t>(3, known_ids.size());
+  for (auto &[tier, indices] : tiers) {
+    std::set<std::pair<uint64_t, uint32_t>> sample;
+    for (auto i : indices) {
+      auto id = work[i].a.id;
+      sample.emplace(offset_sample_key(id), id);
+      if (sample.size() > 64)
+        sample.erase(std::prev(sample.end()));
+    }
+    std::vector<OffsetEvidence> evidence;
+    std::vector<size_t> selected;
+    for (auto i : indices) {
+      auto &w = work[i];
+      if (!sample.count({offset_sample_key(w.a.id), w.a.id}))
         continue;
       auto q = encode(w.a.bases().substr(w.a.clip_left,
                                          w.a.bases().size() - w.a.clip_left - w.a.clip_right))
                    .bases;
+      evidence.push_back({w.a.id, w.unique, discover_offsets(q, ref, w.hbegin, max_error)});
+      selected.push_back(i);
+    }
+    // Prefer decisive unique evidence within a tier; otherwise compare all
+    // known placements. Each ID counts once and strong unique conflict vetoes.
+    for (bool only_unique : {true, false}) {
       try {
-        auto target = ref.substr(size_t(lo), size_t(hi - lo));
-        if (b < 0 || e > int64_t(ref.size()))
-          (void)align_boundary(q, target, b<0, e> int64_t(ref.size()), max_error);
-        else
-          (void)align(q, target, max_error);
-        ++validated;
-      } catch (const std::runtime_error &) {
-        // A repeat-tied overlap is not validation, even with a unique chunk.
+        auto choice = choose_offset(evidence, required, only_unique);
+        std::set<uint32_t> validated;
+        for (size_t j = 0; j < evidence.size(); ++j) {
+          auto &ev = evidence[j];
+          if ((only_unique && !ev.unique) || validated.count(ev.id) ||
+              std::none_of(ev.offsets.begin(), ev.offsets.end(),
+                           [&](int64_t x) { return std::abs(x - choice.value) <= 20; }))
+            continue;
+          auto &w = work[selected[j]];
+          auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                             w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                       .bases;
+          if (validate_offset_overlap(q, ref, w.hbegin, w.hend, choice.value, max_error))
+            validated.insert(ev.id);
+        }
+        std::cerr << "offset layout rescue: tier=" << tier << " unique_only=" << only_unique
+                  << " offset=" << choice.value << " support=" << choice.support
+                  << " informative=" << choice.informative << " runner_up=" << choice.runner_up
+                  << " validated=" << validated.size() << '\n';
+        if (validated.size() < required || validated.size() * 5 < choice.support * 3)
+          continue;
+        out.value = choice.value;
+        out.layout_rescue = true;
+        out.attempted = selected.size();
+        out.placed = choice.support;
+        out.validated = validated.size();
+        return out;
+      } catch (const std::runtime_error &e) {
+        std::cerr << "offset layout rescue: tier=" << tier << " unique_only=" << only_unique << ' '
+                  << e.what() << '\n';
       }
     }
-    if (validated >= (out.sparse ? 1u : 3u)) {
-      out.value = candidate;
-      out.internal = true;
-      out.validated = validated;
-      out.placed = std::count_if(anchors.begin(), anchors.end(), [&](const auto &read) {
-        return std::any_of(read.begin(), read.end(),
-                           [&](int64_t x) { return std::abs(x - candidate) <= 20; });
-      });
-      std::cerr << "offset rescue: internal anchors, offset " << candidate
-                << ", validated overlaps " << validated << '\n';
-      return out;
-    }
-  } catch (const std::runtime_error &) {
-    // Do not guess an offset when internal evidence is weak or contradictory.
   }
   throw std::runtime_error("Cannot infer reliable template offset from " +
                            std::to_string(out.attempted) + " reads (" +
                            std::to_string(estimates.size()) + " unique placements)");
+}
+// Region mode normally retains only its established unique fast-path anchors.
+// On failure, reread the package with a bounded per-tier sample of known reads.
+// This avoids loading a whole chromosome merely to test a small region, and
+// uses the same ID sampling and placement multiplicities as whole-tig rescue.
+static std::vector<Work> region_rescue_reads(const Options &o,
+                                             const std::map<uint32_t, unsigned> &occurrences,
+                                             const std::map<uint32_t, unsigned> &declared) {
+  readBuffer input(o.input.c_str());
+  while (!input.eof()) {
+    tgTig t;
+    ReadOwner owner;
+    std::map<int, std::set<std::pair<uint64_t, uint32_t>>> samples;
+    std::set<uint32_t> seen;
+    auto retain = [&](tgTig &tig, sqRead &read, ReadOwner &storage) {
+      if (tig.tigID() != o.region_tig)
+        return false;
+      auto id = read.sqRead_readID();
+      if (!seen.insert(id).second || declared.at(id) == 0)
+        return false;
+      int tier = tier_of(read.sqRead_name(), o.tiers);
+      if (tier < 0)
+        return false;
+      auto &sample = samples[tier];
+      sample.emplace(offset_sample_key(id), id);
+      if (sample.size() > 64) {
+        auto last = std::prev(sample.end());
+        uint32_t removed = last->second;
+        sample.erase(last);
+        storage.reads.erase(removed);
+        if (removed == id)
+          return false;
+      }
+      return true;
+    };
+    if (!load_package(input, t, &owner, retain))
+      break;
+    if (t.tigID() != o.region_tig)
+      continue;
+    std::vector<Work> result;
+    for (uint32_t i = 0; i < t.numberOfChildren(); ++i) {
+      auto p = t.getChild(i);
+      auto it = owner.reads.find(p->ident());
+      if (it == owner.reads.end() || p->_numPlacement == 0)
+        continue;
+      auto &rd = it->second;
+      Work w;
+      w.a.id = p->ident();
+      w.a.name = rd.name;
+      w.a.tier = tier_of(rd.name, o.tiers);
+      w.placements = std::max(occurrences.at(w.a.id), declared.at(w.a.id));
+      w.unique = p->_numPlacement == 1 && w.placements == 1;
+      w.a.reverse = p->isReverse();
+      if (w.a.reverse && !rd.reverse)
+        rd.reverse = std::make_shared<const std::string>(reverse_complement(*rd.sequence));
+      w.a.shared_sequence = w.a.reverse ? rd.reverse : rd.sequence;
+      require(p->min() >= 0 && p->max() > p->min() && size_t(p->max()) <= t.length(),
+              "Invalid layout interval in rescue anchor");
+      require(p->_askip >= 0 && p->_bskip >= 0 &&
+                  size_t(p->_askip) + p->_bskip < w.a.bases().size(),
+              "Invalid clipping in rescue anchor");
+      w.hbegin = p->min();
+      w.hend = p->max();
+      w.a.clip_left = p->_askip;
+      w.a.clip_right = p->_bskip;
+      result.push_back(std::move(w));
+    }
+    return result;
+  }
+  throw std::runtime_error("Missing region tig during offset rescue");
 }
 int main(int argc, char **argv) {
   fs::path staging;
@@ -481,7 +625,13 @@ int main(int argc, char **argv) {
           w.hend = p->max();
           seeds.push_back(std::move(w));
         }
-        region_offset = infer_offset(seeds, t.length(), template_seq, o.max_error, eligible);
+        try {
+          region_offset = infer_offset(seeds, t.length(), template_seq, o.max_error, eligible);
+        } catch (const std::runtime_error &) {
+          seeds.clear();
+          auto rescue = region_rescue_reads(o, occurrences, declared);
+          region_offset = infer_offset(rescue, t.length(), template_seq, o.max_error, eligible, true);
+        }
         // At least one raw base per run guarantees this prefix reaches END.
         // Keep full overlapping placements as context so artificial boundaries
         // do not change their run correspondence. Do not recursively extend.
@@ -554,7 +704,8 @@ int main(int argc, char **argv) {
           w.placements = 0;
         w.unique = p->_numPlacement == 1 && w.placements == 1;
         // Known non-unique reads can supply fallback evidence. Unknown placement
-        // counts remain export-only. Offset anchors still require unique reads.
+        // counts remain export-only. Known placements can still anchor offsets
+        // when --unique-only excludes them from consensus voting.
         if (!w.unique && o.cram.empty() && !(o.ambiguous_fallback && w.placements > 1))
           w.reason = "AMBIGUOUS_PLACEMENT";
         // Legacy skipConsensus encodes template-building priority, not exclusion.
@@ -562,7 +713,8 @@ int main(int argc, char **argv) {
         else if (w.a.tier < 0) {
           require(o.drop_unmatched, "Unmatched read name: " + w.a.name);
           w.reason = "UNMATCHED_TIER";
-        } else {
+        }
+        if (w.a.tier >= 0 && (w.reason.empty() || w.placements > 0)) {
           require(p->min() >= 0 && p->max() > p->min() && size_t(p->max()) <= tig.length(),
                   "Invalid layout interval");
           w.hbegin = p->min();
@@ -639,13 +791,18 @@ int main(int argc, char **argv) {
             (i && ref[i] == ref[i - 1]))
           throw std::runtime_error("Template is not homopolymer compressed: " + name);
       auto inferred = o.region ? region_offset : infer_offset(work, tig.length(), ref, o.max_error);
+      // Offset-only reads must not remain resident through consensus calling.
+      for (auto &w : work)
+        if (!w.reason.empty() && o.cram.empty())
+          w.a.shared_sequence.reset();
       int64_t offset = inferred.value;
       outputs[".template-offsets.tsv"] << name << '\t' << offset << '\t' << inferred.attempted
                                        << '\t' << inferred.placed << '\t' << inferred.validated
                                        << "\t20\t"
-                                       << (inferred.internal ? "INTERNAL_OVERLAP"
-                                           : inferred.sparse ? "SPARSE"
-                                                             : "VALIDATED")
+                                       << (inferred.layout_rescue ? "LAYOUT_OVERLAP"
+                                           : inferred.internal    ? "INTERNAL_OVERLAP"
+                                           : inferred.sparse      ? "SPARSE"
+                                                                  : "VALIDATED")
                                        << '\n';
       std::cerr << "tig " << name << ": inferred template offset " << offset << " from "
                 << inferred.placed << " reads\n";

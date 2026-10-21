@@ -127,8 +127,10 @@ interpret truth-selected diagnostic loci as genome-wide QV validation.
 
 The `core` tests also cover internal offset anchors, repeated-template rejection,
 one-read-one-vote clustering, competing clusters, and signed sparse offsets.
-`native-offset` generates a native package whose reads overhang both template
-ends and checks recovery in full-tig and region modes with `--no-extend-ends`.
+`native-offset` generates one native package with two tigs whose reads overhang
+both template ends. The second has five agreeing reads, one offset outlier,
+and one uninformative read. It checks whole-package and region recovery with
+`--no-extend-ends`, so success on just the first tig is insufficient.
 Neither test needs external genome data.
 
 `borrow` checks unmodeled confidence protection and bounded ambiguous support.

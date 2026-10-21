@@ -157,9 +157,11 @@ within 20 bases. The combined cluster's lower median is used. This is a
 heuristic consistency check, not a calibrated confidence probability.
 If that whole-read method fails, a bounded fallback examines five internal
 chunks per candidate read (up to 5,000 HPC bases each). Only chunks occurring
-exactly once in the template provide anchors. At least six independent reads
-(one for sparse layouts) and 75% of informative reads must support a 20-base
-offset cluster; a distant cluster with at least half as much support is rejected.
+exactly once in the template provide anchors. At least 75% of informative
+reads must support a 20-base offset cluster, with a minimum of three independent
+supporting reads (one for sparse layouts). Thus five agreeing reads out of six
+can qualify; six agreeing reads are not always required.
+A distant cluster with at least half as much support is rejected.
 Each read counts once, regardless of how many chunks match. At least three
 supporting reads (one for sparse layouts) must also pass full predicted-overlap
 alignment, with free overhangs at template boundaries. This rescues short

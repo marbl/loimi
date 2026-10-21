@@ -204,7 +204,14 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
     anchors.push_back(internal_offsets(q, ref, int64_t(w.hbegin)));
   }
   try {
-    auto candidate = internal_offset_cluster(anchors, out.sparse ? 1 : 6);
+    // Six absolute supporting anchors is impossible for a small informative
+    // sample with even one outlier. Preserve the 75% agreement rule, with a
+    // floor of three independent reads outside the existing sparse path.
+    size_t informative = std::count_if(anchors.begin(), anchors.end(),
+                                       [](const auto &read) { return !read.empty(); });
+    size_t required =
+        out.sparse ? 1 : std::max<size_t>(3, std::min<size_t>(6, (3 * informative + 3) / 4));
+    auto candidate = internal_offset_cluster(anchors, required);
     size_t validated = 0;
     for (size_t j = 0; j < limit; ++j) {
       if (std::none_of(anchors[j].begin(), anchors[j].end(),

@@ -58,13 +58,14 @@ std::string reverse_complement(std::string s) {
   }
   return s;
 }
-std::string align(const std::string &q, const std::string &r, double rate) {
+std::string align(const std::string &q, const std::string &r, double rate, size_t distance_bound) {
   // Most HiFi HPC reads match their supplied interval exactly; avoid edlib then.
   if (q == r)
     return std::string(q.size(), '=');
   if (std::max(q.size(), r.size()) > INT32_MAX)
     throw std::runtime_error("Alignment exceeds edlib limit");
   int k = static_cast<int>(std::ceil(rate * std::max(q.size(), r.size())));
+  k = static_cast<int>(std::min<size_t>(k, distance_bound));
   auto result = merylutil::edlibAlign(
       q.data(), q.size(), r.data(), r.size(),
       merylutil::edlibNewAlignConfig(k, merylutil::EDLIB_MODE_NW, merylutil::EDLIB_TASK_PATH));

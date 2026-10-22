@@ -14,6 +14,50 @@ static void check(bool v, const char *msg) {
 }
 int main() {
   {
+    // Search bounds must preserve the canonical trace, not just edit distance:
+    // repeat indel placement can change downstream polishing evidence.
+    std::mt19937 rng(817);
+    for (size_t trial = 0; trial < 1000; ++trial) {
+      std::string q, r;
+      for (size_t i = 0; i < 50 + trial % 200; ++i)
+        q += "AACCGT"[rng() % 6];
+      r = q;
+      for (size_t i = 0; i < 8; ++i) {
+        size_t p = rng() % r.size();
+        if (i % 3 == 0)
+          r.erase(p, 1);
+        else if (i % 3 == 1)
+          r.insert(p, 1, "ACGT"[rng() % 4]);
+        else
+          r[p] = "ACGT"[rng() % 4];
+      }
+      auto expected = align(q, r, 1.0);
+      size_t distance =
+          std::count_if(expected.begin(), expected.end(), [](char op) { return op != '='; });
+      check(align(q, r, 1.0, distance) == expected, "Tight bound preserves trace");
+      check(align(q, r, 1.0, distance + 3) == expected, "Loose bound preserves trace");
+    }
+    // Long noisy intervals exercise recursive traceback as used by UL reads.
+    std::string q;
+    for (size_t i = 0; i < 20000; ++i)
+      q += "ACGT"[rng() % 4];
+    auto r = q;
+    for (size_t i = 100; i < r.size(); i += 31)
+      r[i] = "ACGT"[rng() % 4];
+    r.insert(10000, 100, 'A');
+    auto expected = align(q, r, 0.15);
+    size_t distance =
+        std::count_if(expected.begin(), expected.end(), [](char op) { return op != '='; });
+    check(align(q, r, 0.15, distance) == expected, "Long bounded traceback parity");
+    bool rejected = false;
+    try {
+      (void)align("AAAA", "TTTT", 0.1, 4);
+    } catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    check(rejected, "Upper bound cannot loosen the error-rate cutoff");
+  }
+  {
     std::string interior;
     for (int i = 0; i < 50; ++i)
       interior += "ACGT";

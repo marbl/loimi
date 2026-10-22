@@ -1169,9 +1169,14 @@ int main(int argc, char **argv) {
             // Prototype: realign the layout interval when its HPC trace has errors.
             if (w.trace.find_first_of("XID") != std::string::npos) {
               w.raw_alignment_attempted = true;
+              // The lifted HPC trace already aligns these exact raw intervals.
+              // Its unit-cost edit count bounds the optimum without imposing
+              // new anchors or changing the accepted maximum error rate.
+              size_t bound =
+                  std::count_if(w.a.ops.begin(), w.a.ops.end(), [](char op) { return op != '='; });
               w.a.ops = align(w.a.bases().substr(w.a.clip_left, w.a.bases().size() - w.a.clip_left -
                                                                     w.a.clip_right),
-                              draft.substr(w.a.begin, w.a.end - w.a.begin), o.max_error);
+                              draft.substr(w.a.begin, w.a.end - w.a.begin), o.max_error, bound);
             }
             size_t nm;
             md(w.a, draft, nm);
@@ -1284,8 +1289,20 @@ int main(int argc, char **argv) {
       write_fasta(fa, name, final);
       refs.emplace_back(name, final.size());
       if (!o.cram.empty()) {
-        for (auto &w : work)
-          if (w.reason.empty()) {
+        // Realign independently in bounded batches, then emit in original order.
+        // This preserves first-successful-placement primary selection and avoids
+        // retaining expanded final traces for an entire chromosome at once.
+        for (size_t batch = 0; batch < work.size();) {
+          size_t end = batch, bases = 0;
+          do {
+            bases += work[end].a.bases().size();
+            ++end;
+          } while (end < work.size() && end - batch < 4096 && bases < o.batch_bases);
+          std::vector<uint8_t> attempted(end - batch, 0);
+          parallel(end - batch, o.threads, [&](size_t j) {
+            auto &w = work[batch + j];
+            if (!w.reason.empty())
+              return;
             bool touches = false;
             for (auto &e : edits)
               if (e.edit.begin <= w.a.end && e.edit.end >= w.a.begin)
@@ -1296,7 +1313,7 @@ int main(int argc, char **argv) {
             // needs a new trace and fresh NM/MD against the final reference.
             try {
               if (touches) {
-                ++base_alignments;
+                attempted[j] = 1;
                 // Realign against the polished context before rebasing to the crop.
                 auto target =
                     (o.region ? region_reference : final).substr(w.a.begin, w.a.end - w.a.begin);
@@ -1306,6 +1323,18 @@ int main(int argc, char **argv) {
                           target, o.max_error);
                 w.a.packed_ops = false;
               }
+            } catch (const std::bad_alloc &) {
+              throw;
+            } catch (const std::exception &e) {
+              w.reason = "FINAL_ALIGNMENT_FAILED";
+            }
+          });
+          base_alignments += std::count(attempted.begin(), attempted.end(), uint8_t(1));
+          for (size_t i = batch; i < end; ++i) {
+            auto &w = work[i];
+            if (!w.reason.empty())
+              continue;
+            try {
               if (o.region && !crop_alignment(w.a, final_begin, final_end))
                 continue;
               size_t nm;
@@ -1330,6 +1359,11 @@ int main(int argc, char **argv) {
               w.reason = "FINAL_ALIGNMENT_FAILED";
             }
           }
+          // Also release traces for failed or region-cropped placements.
+          for (size_t i = batch; i < end; ++i)
+            std::string().swap(work[i].a.ops);
+          batch = end;
+        }
       }
       for (auto &w : work) {
         if (!w.reason.empty())

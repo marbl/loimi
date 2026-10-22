@@ -47,6 +47,28 @@ storage lifetimes and original placement order, not just its final sequence.
 
 ## Development loop
 
+Performance port validation (2026-10-22): the 230441637 fixture with four threads,
+polishing, and CRAM took 19.91 s before and 13.37 s after; OS peak RSS was
+278.4/284.9 MiB. All text artifacts and decoded SAM records matched. Other runs
+were active, so timings are preliminary. This master policy accepts no edit in
+that fixture; native edited-template tests cover final-reference parallelism.
+Commands and hashes: `../hg002-test/perf-master/site230/comparison.json`.
+The full consensus-only part026 rerun is pending; its launch command writes
+`../cns-crash/full-026-perf.comparison.txt` only after successful completion and
+byte comparisons of FASTA and all four diagnostic outputs against the baseline.
+
+Initial raw realignment uses the valid HPC-derived raw trace's edit count as
+an optional Edlib upper bound, capped by the original error-rate limit. The
+bound is valid only for the same sequences and clipping. Regression tests
+compare exact traces, not just edit distances, including a long noisy input.
+
+Final-reference CRAM realignment runs in batches capped by `--batch-bases` and
+4,096 placements (one oversized read is admitted). Workers own separate
+placements; SAM emission and primary selection remain serial in original order.
+Expanded final traces are released after each batch. This bounds batch storage,
+not total RSS or individual aligner scratch. Native tests compare serial and
+parallel CRAM records across batch sizes.
+
 1. Preserve a known-good executable before a behavior-preserving change.
 2. Add a small deterministic regression for the affected contract. Prefer
    comparing optimized code with a simple reference algorithm over timing tests.

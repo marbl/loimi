@@ -177,6 +177,9 @@ loci and anchors shorter than 128 HPC bases are rejected. Local optimal
 endpoints within 256 HPC bases describe one uncertain locus. Noisy matches
 pinned to either sequence boundary are checked with internal anchors instead
 of assuming they represent a complete overlap.
+If the initial exact internal chain fails, chunk widths are halved down to
+128 HPC bases. Each chain still requires separated, unique template matches
+and subsequent fixed-overlap validation; shorter chunks only propose origins.
 
 The rescue evaluates shared candidates against all sampled reads, allowing
 lower tiers to corroborate a higher-tier origin. Local proposals are grouped
@@ -193,14 +196,19 @@ to avoid rewarding tiny perfect overlaps. Candidates within 0.001 of a
 molecule's best cost share its support. Each tier is evaluated independently in
 user order, with unique support breaking an equal count within that tier.
 The first decisive tier wins: its leading candidate must meet the independent
-molecule minimum, have at least 60% of that tier's informative molecules, and
+molecule minimum (or unanimous informative support within that tier), have at
+least 60% of that tier's informative molecules, and
 have no equally supported distant candidate in that tier. A split, tied, or
 insufficiently corroborated tier falls through to the next tier. Lower tiers
 can corroborate or resolve an inconclusive higher tier, but cannot override a
 decisive higher tier. A candidate requires
 one molecule for a one-molecule sample, two for samples of two or three, and
 three for larger samples (`min(3, n / 2 + 1)`), counting independent support
-across tiers. The selected tier is reported in the rescue log. Nearby
+across tiers. The selected tier is reported in the rescue log.
+Unanimity permits a single informative molecule when other sampled reads have
+no usable scores, but never bypasses the competing-distant-offset check.
+This explicitly relaxes the independent-support minimum, not the alignment gate.
+Nearby
 representatives within 512 HPC bases are
 treated as local coordinate uncertainty, not competing repeat copies.
 These are heuristic consistency checks, not calibrated confidence probabilities;

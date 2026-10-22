@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT-0
 #include "offsets.hpp"
-#include "core.hpp"
 #include "align/edlib.H"
+#include "core.hpp"
 #include <algorithm>
-#include <cmath>
 #include <cctype>
-#include <limits>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -18,7 +18,8 @@ constexpr double missing_overlap_penalty = .01;
 constexpr double indistinguishable_score_slack = .001;
 constexpr size_t max_offset_loci = 128;
 } // namespace
-std::vector<int64_t> internal_offsets(const std::string &q, const std::string &r, int64_t begin) {
+std::vector<int64_t> internal_offsets(const std::string &q,
+                                      const std::string &r, int64_t begin) {
   const size_t width = std::min<size_t>(5000, r.size() / 4);
   std::vector<int64_t> result;
   if (width < 128 || q.size() < width)
@@ -35,8 +36,8 @@ std::vector<int64_t> internal_offsets(const std::string &q, const std::string &r
   return result;
 }
 
-int64_t internal_offset_cluster(const std::vector<std::vector<int64_t>> &reads, size_t required,
-                                int64_t tolerance) {
+int64_t internal_offset_cluster(const std::vector<std::vector<int64_t>> &reads,
+                                size_t required, int64_t tolerance) {
   std::vector<int64_t> starts;
   size_t informative = 0;
   for (const auto &r : reads) {
@@ -68,10 +69,13 @@ int64_t internal_offset_cluster(const std::vector<std::vector<int64_t>> &reads, 
       start = x;
     }
   }
-  if (best.empty() || best.size() < required || best.size() * 4 < informative * 3)
-    throw std::runtime_error("Insufficient independent internal offset anchors");
+  if (best.empty() || best.size() < required ||
+      best.size() * 4 < informative * 3)
+    throw std::runtime_error(
+        "Insufficient independent internal offset anchors");
   for (auto x : starts)
-    if (std::abs(x - start) > 2 * tolerance && votes(x).size() * 2 >= best.size())
+    if (std::abs(x - start) > 2 * tolerance &&
+        votes(x).size() * 2 >= best.size())
       throw std::runtime_error("Competing internal offset anchors");
   return best[(best.size() - 1) / 2];
 }
@@ -82,19 +86,22 @@ uint64_t offset_sample_key(uint32_t id) {
   return x ^ (x >> 31);
 }
 
-std::vector<int64_t> discover_offsets(const std::string &q, const std::string &r, int64_t begin,
+std::vector<int64_t> discover_offsets(const std::string &q,
+                                      const std::string &r, int64_t begin,
                                       double rate) {
   // This rescue establishes an origin from sequence, not just layout geometry.
   // Tiny matches cannot provide a reliable anchor even when many reads agree.
-  if (std::min(q.size(), r.size()) < 128 || q.size() > INT32_MAX || r.size() > INT32_MAX)
+  if (std::min(q.size(), r.size()) < 128 || q.size() > INT32_MAX ||
+      r.size() > INT32_MAX)
     return {};
   const bool enclosing = q.size() > r.size();
   const auto &small = enclosing ? r : q;
   const auto &large = enclosing ? q : r;
-  auto a = merylutil::edlibAlign(small.data(), small.size(), large.data(), large.size(),
-                                 merylutil::edlibNewAlignConfig(int(std::ceil(rate * small.size())),
-                                                                merylutil::EDLIB_MODE_HW,
-                                                                merylutil::EDLIB_TASK_LOC));
+  auto a = merylutil::edlibAlign(
+      small.data(), small.size(), large.data(), large.size(),
+      merylutil::edlibNewAlignConfig(int(std::ceil(rate * small.size())),
+                                     merylutil::EDLIB_MODE_HW,
+                                     merylutil::EDLIB_TASK_LOC));
   // Do not turn tied whole-overlap evidence into a confident isolated seed.
   bool resolved = a.editDistance >= 0 && a.numLocations > 0 && a.startLocations;
   // Nearby optimal endpoints describe local alignment uncertainty, not a
@@ -102,76 +109,93 @@ std::vector<int64_t> discover_offsets(const std::string &q, const std::string &r
   bool tied = false;
   if (resolved)
     for (int i = 1; i < a.numLocations; ++i)
-      tied |= std::abs(a.startLocations[i] - a.startLocations[0]) > offset_local_span ||
-              std::abs(a.endLocations[i] - a.endLocations[0]) > offset_local_span;
+      tied |=
+          std::abs(a.startLocations[i] - a.startLocations[0]) >
+              offset_local_span ||
+          std::abs(a.endLocations[i] - a.endLocations[0]) > offset_local_span;
   resolved &= !tied;
   int64_t p = resolved ? a.startLocations[0] : -1;
   // A noisy reverse alignment pinned to a read boundary can be a truncated
   // template, rather than a truly enclosing read. Let internal chains test it.
-  bool truncated =
-      resolved && a.editDistance > 0 && (p == 0 || a.endLocations[0] + 1 == int(large.size()));
+  bool truncated = resolved && a.editDistance > 0 &&
+                   (p == 0 || a.endLocations[0] + 1 == int(large.size()));
   merylutil::edlibFreeAlignResult(a);
   if (resolved && !truncated)
     return {enclosing ? begin + p : begin - p};
   if (tied)
     return {};
 
-  size_t width = std::min<size_t>(2000, r.size() / 4);
-  if (width < 128 || q.size() < 2 * width)
-    return {};
-  size_t samples = std::min<size_t>(64, 1 + (q.size() - width + width / 2 - 1) / (width / 2));
-  std::vector<std::pair<int64_t, size_t>> points;
-  for (size_t i = 0; i < samples; ++i) {
-    size_t qb = (q.size() - width) * i / (samples - 1);
-    auto chunk = q.substr(qb, width);
-    if (chunk.find('N') != std::string::npos)
+  // Sparse partial overlaps can contain several good shorter anchors but no
+  // two 2-kb anchors separated by 2 kb. Try smaller exact chunks only when
+  // the stronger chain fails. Every proposal still needs fixed-overlap scoring.
+  for (size_t width = std::min<size_t>(2000, r.size() / 4); width >= 128;
+       width /= 2) {
+    if (q.size() < 2 * width)
       continue;
-    size_t hit = r.find(chunk);
-    if (hit != std::string::npos && r.find(chunk, hit + 1) == std::string::npos)
-      points.emplace_back(begin + int64_t(qb) - int64_t(hit), qb);
-  }
-  std::sort(points.begin(), points.end());
-  std::vector<int64_t> result;
-  for (size_t i = 0; i < points.size(); ++i) {
-    size_t j = i, lo = points[i].second, hi = lo;
-    while (j < points.size() && points[j].first - points[i].first <= 20) {
-      lo = std::min(lo, points[j].second);
-      hi = std::max(hi, points[j].second);
-      ++j;
+    size_t samples = std::min<size_t>(
+        64, 1 + (q.size() - width + width / 2 - 1) / (width / 2));
+    std::vector<std::pair<int64_t, size_t>> points;
+    for (size_t i = 0; i < samples; ++i) {
+      size_t qb = (q.size() - width) * i / (samples - 1);
+      auto chunk = q.substr(qb, width);
+      if (chunk.find('N') != std::string::npos)
+        continue;
+      size_t hit = r.find(chunk);
+      if (hit != std::string::npos &&
+          r.find(chunk, hit + 1) == std::string::npos)
+        points.emplace_back(begin + int64_t(qb) - int64_t(hit), qb);
     }
-    if (hi - lo >= width)
-      result.push_back(points[i + (j - i - 1) / 2].first);
+    std::sort(points.begin(), points.end());
+    std::vector<int64_t> result;
+    for (size_t i = 0; i < points.size(); ++i) {
+      size_t j = i, lo = points[i].second, hi = lo;
+      while (j < points.size() && points[j].first - points[i].first <= 20) {
+        lo = std::min(lo, points[j].second);
+        hi = std::max(hi, points[j].second);
+        ++j;
+      }
+      if (hi - lo >= width)
+        result.push_back(points[i + (j - i - 1) / 2].first);
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    if (!result.empty())
+      return result;
   }
-  std::sort(result.begin(), result.end());
-  result.erase(std::unique(result.begin(), result.end()), result.end());
-  return result;
+  return {};
 }
 
-OffsetScore score_offset_overlap(const std::string &q, const std::string &r, int64_t begin,
-                                 int64_t end, int64_t offset, double rate) {
+OffsetScore score_offset_overlap(const std::string &q, const std::string &r,
+                                 int64_t begin, int64_t end, int64_t offset,
+                                 double rate) {
   auto b = begin - offset, e = end - offset;
   auto lo = std::max<int64_t>(0, b), hi = std::min<int64_t>(r.size(), e);
-  if (hi <= lo || hi - lo < 128 || hi - lo < int64_t(std::min<size_t>(1000, r.size())))
+  if (hi <= lo || hi - lo < 128 ||
+      hi - lo < int64_t(std::min<size_t>(1000, r.size())))
     return {};
   // Clip only the overhang predicted by the layout transform. Using an infix
   // alignment of the entire read here would silently relocate a candidate to
   // whichever repeat copy aligns best, invalidating the coordinate check.
   int64_t qb = std::max<int64_t>(0, -b);
-  int64_t qe = e <= int64_t(r.size()) ? int64_t(q.size())
-                                      : std::min<int64_t>(q.size(), int64_t(r.size()) - b);
+  int64_t qe = e <= int64_t(r.size())
+                   ? int64_t(q.size())
+                   : std::min<int64_t>(q.size(), int64_t(r.size()) - b);
   if (qb >= qe || qe - qb > INT32_MAX || hi - lo > INT32_MAX)
     return {};
-  auto a = merylutil::edlibAlign(q.data() + qb, int(qe - qb), r.data() + lo, int(hi - lo),
-                                 merylutil::edlibNewAlignConfig(int(std::ceil(rate * (hi - lo))),
-                                                                merylutil::EDLIB_MODE_NW,
-                                                                merylutil::EDLIB_TASK_DISTANCE));
+  auto a = merylutil::edlibAlign(
+      q.data() + qb, int(qe - qb), r.data() + lo, int(hi - lo),
+      merylutil::edlibNewAlignConfig(int(std::ceil(rate * (hi - lo))),
+                                     merylutil::EDLIB_MODE_NW,
+                                     merylutil::EDLIB_TASK_DISTANCE));
   int edits = a.editDistance;
   merylutil::edlibFreeAlignResult(a);
-  return edits < 0 ? OffsetScore{} : OffsetScore{size_t(hi - lo), size_t(edits)};
+  return edits < 0 ? OffsetScore{}
+                   : OffsetScore{size_t(hi - lo), size_t(edits)};
 }
 
-bool validate_offset_overlap(const std::string &q, const std::string &r, int64_t begin, int64_t end,
-                             int64_t offset, double rate) {
+bool validate_offset_overlap(const std::string &q, const std::string &r,
+                             int64_t begin, int64_t end, int64_t offset,
+                             double rate) {
   return score_offset_overlap(q, r, begin, end, offset, rate).overlap != 0;
 }
 
@@ -179,13 +203,16 @@ std::string offset_molecule(const std::string &name, uint32_t id) {
   // Corrected ONT and its original UL record can have different packaged IDs.
   // Recognize only the explicit hifi_UUID / ont_UUID convention; do not guess
   // identities from arbitrary names or remove PacBio subread/CCS suffixes.
-  size_t prefix = name.starts_with("hifi_") ? 5 : name.starts_with("ont_") ? 4 : 0;
+  size_t prefix = name.starts_with("hifi_")  ? 5
+                  : name.starts_with("ont_") ? 4
+                                             : 0;
   if (prefix && name.size() == prefix + 36) {
     auto uuid = name.substr(prefix);
     bool valid = true;
     for (size_t i = 0; i < uuid.size(); ++i) {
       bool dash = i == 8 || i == 13 || i == 18 || i == 23;
-      valid &= dash ? uuid[i] == '-' : bool(std::isxdigit(static_cast<unsigned char>(uuid[i])));
+      valid &= dash ? uuid[i] == '-'
+                    : bool(std::isxdigit(static_cast<unsigned char>(uuid[i])));
       uuid[i] = std::tolower(static_cast<unsigned char>(uuid[i]));
     }
     if (valid)
@@ -207,7 +234,8 @@ std::vector<int64_t> offset_candidates(const std::vector<OffsetEvidence> &reads,
   for (size_t i = 0; i < reads.size(); ++i)
     for (auto x : reads[i].offsets)
       proposals.push_back({x, tiers[i], reads[i].id});
-  std::sort(proposals.begin(), proposals.end(), [](auto a, auto b) { return a.value < b.value; });
+  std::sort(proposals.begin(), proposals.end(),
+            [](auto a, auto b) { return a.value < b.value; });
   std::vector<int64_t> result;
   for (size_t i = 0; i < proposals.size();) {
     size_t end = i;
@@ -234,7 +262,8 @@ std::vector<int64_t> offset_candidates(const std::vector<OffsetEvidence> &reads,
   // mapper. Excessive locus ambiguity must fail explicitly instead of dropping
   // an arbitrary competitor or growing chromosome-scale alignment work.
   if (result.size() > max_offset_loci)
-    throw std::runtime_error("Offset rescue has more than 128 distinct candidate loci");
+    throw std::runtime_error(
+        "Offset rescue has more than 128 distinct candidate loci");
   return result;
 }
 
@@ -292,7 +321,8 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
     double best = *std::min_element(cost.begin(), cost.end());
     ++informative[tier];
     for (size_t i = 0; i < n; ++i)
-      // Near-equal alignments support both hypotheses, never an arbitrary winner.
+      // Near-equal alignments support both hypotheses, never an arbitrary
+      // winner.
       if (cost[i] <= best + indistinguishable_score_slack) {
         ++votes[tier][i];
         unique_votes[tier][i] += unique[i];
@@ -331,16 +361,22 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
     size_t runner = 0;
     bool tied = false;
     for (size_t i = 0; i < n; ++i)
-      if (i != best && std::abs(candidates[i] - candidates[best]) > 2 * offset_local_span) {
+      if (i != best &&
+          std::abs(candidates[i] - candidates[best]) > 2 * offset_local_span) {
         runner = std::max(runner, support[i]);
         tied |= compare(i, best) == 0;
       }
     bool majority = votes[tier][best] * 5 >= informative[tier] * 3;
-    if (support[best] >= required && majority && !tied)
+    // Sparse tiers can be decisive even when other sampled molecules provide
+    // no usable alignment. Keep the distant-candidate ambiguity veto: one read
+    // supporting two repeat copies is not a resolved unanimous vote.
+    bool unanimous = votes[tier][best] == informative[tier];
+    if ((support[best] >= required || unanimous) && majority && !tied)
       return {candidates[best], support[best], total, runner, tier};
     rejected << " tier=" << tier << " candidate=" << candidates[best]
-             << " tier_support=" << votes[tier][best] << "/" << informative[tier]
-             << " support=" << support[best] << " required=" << required << " runner_up=" << runner
+             << " tier_support=" << votes[tier][best] << "/"
+             << informative[tier] << " support=" << support[best]
+             << " required=" << required << " runner_up=" << runner
              << " tied=" << tied << " majority=" << majority << ";";
   }
   throw std::runtime_error("Joint offset unresolved:" + rejected.str());

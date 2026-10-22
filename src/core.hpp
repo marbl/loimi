@@ -23,7 +23,10 @@ std::string reverse_complement(std::string s);
 // Each operation consumes one query and/or reference base: = X I D.
 // Global unit-cost alignment, capped at ceil(max_error * max(sequence lengths)).
 // Throws on failed alignment. Returned traces are expanded, not CIGAR strings.
-std::string align(const std::string &query, const std::string &reference, double max_error);
+// Optional upper bound must come from a valid end-to-end alignment of these
+// exact sequences. It narrows search only; the error-rate acceptance stays intact.
+std::string align(const std::string &query, const std::string &reference, double max_error,
+                  size_t distance_bound = SIZE_MAX);
 // Centered local-quality gate in expanded HPC alignment-operation space.
 // X/I/D all count as errors. Terminal windows are truncated to the trace.
 // Empty means every matching operation is eligible (including exact traces).

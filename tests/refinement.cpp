@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: MIT-0
+#include "experiments/refinement.hpp"
+#include <sstream>
+#include <stdexcept>
+using namespace hpc;
+using namespace hpc::experimental;
+static void check(bool ok) {
+  if (!ok)
+    throw std::runtime_error("Refinement regression");
+}
+int main() {
+  std::istringstream calibration("HPC_RUN_MODEL_V1 4 5\nG 1 1 .01 .96 .01 .01 .01\n"
+                                 "G 2 1 .01 .01 .55 .42 .01\nG 3 1 .01 .01 .42 .55 .01\n");
+  auto model = RunModel::read(calibration);
+  auto target = corroboration_target(model, 'G', {{2, 3}, {3, 2}});
+  check(target && target->first == 2 && target->second == 3);
+  check(!corroboration_target(model, 'G', {{2, 4}}));
+  check(!corroboration_target(model, 'A', {{2, 10}}));
+  check(!corroborate(model, 'G', {{3, 4}}, *target));
+  check(corroborate(model, 'G', {{3, 10}}, *target) == 2); // insufficient LR
+  std::istringstream lower("HPC_RUN_MODEL_V1 4 5\nG 1 1 .01 .96 .01 .01 .01\n"
+                           "G 2 1 .01 .01 .80 .17 .01\nG 3 1 .01 .01 .17 .80 .01\n");
+  auto low = RunModel::read(lower);
+  check(corroborate(low, 'G', {{3, 5}}, *target) == 3);
+  check(corroborate(low, 'G', {{2, 5}}, *target) == 2);
+  std::string left, right;
+  for (size_t i = 0; i < 25; ++i) {
+    left += "ACTG";
+    right += "TCAG";
+  }
+  left.back() = 'C'; // immediate anchor must not join the G run
+  std::string ref = left + "GG" + right;
+  std::vector<Alignment> reads(10);
+  std::vector<const Alignment *> ptrs;
+  for (size_t i = 0; i < reads.size(); ++i) {
+    auto &a = reads[i];
+    a.id = i + 1;
+    a.begin = 0;
+    a.end = ref.size();
+    a.sequence = left + "GGG" + right;
+    a.ops = cigar(align(a.sequence, ref, .15));
+    a.packed_ops = true;
+    a.reverse = i % 2;
+    ptrs.push_back(&a);
+  }
+  std::vector<HpSite> sites{{100, 102, 'G'}};
+  auto call_hp = [&] { return realign_homopolymers(ref, ptrs, sites, 2, 5, {}, true, 500); };
+  auto edits = call_hp();
+  check(edits.size() == 1 && edits[0].edit.alt == "GGG" && edits[0].tier == 0);
+  check(hpc::apply(ref, edits) == left + "GGG" + right);
+  // The combined pass must reapply corroboration rather than reverting to LA
+  // alone, and end filtering must apply to the rebuilt evidence as well.
+  for (size_t i = 0; i < reads.size(); ++i) {
+    reads[i].tier = i < 5 ? 0 : 1;
+    reads[i].sequence = left + (i < 3 ? "GG" : "GGG") + right;
+    reads[i].ops = cigar(align(reads[i].sequence, ref, .15));
+  }
+  check(realign_homopolymers(ref, ptrs, sites, 2, 5, {{0, model}}, true, 500).empty());
+  auto combined = realign_homopolymers(ref, ptrs, sites, 2, 5, {{0, model}}, true, 500, {{1, low}});
+  check(combined.size() == 1 && combined[0].edit.alt == "GGG");
+  check(realign_homopolymers(ref, ptrs, sites, 2, 5, {{0, model}}, true, 500, {{1, low}}, 500)
+            .empty());
+  // Non-unique lower-tier evidence cannot corroborate a qualified unique call.
+  for (size_t i = 5; i < reads.size(); ++i)
+    reads[i].tier = 3;
+  check(realign_homopolymers(ref, ptrs, sites, 2, 5, {{0, model}}, true, 500, {{1, low}}).empty());
+  for (auto &a : reads) {
+    a.sequence = left + "GGG" + right;
+    a.ops = cigar(align(a.sequence, ref, .15));
+  }
+  // A qualifying lower UNIQUE tier outranks non-unique high-tier observations.
+  for (size_t i = 0; i < 10; ++i) {
+    reads[i].tier = i < 5 ? 2 : 1;
+    if (i >= 5) {
+      reads[i].sequence = ref;
+      reads[i].ops = std::to_string(ref.size()) + "=";
+    }
+  }
+  check(call_hp().empty());
+  for (auto &a : reads)
+    a.tier = 2;
+  check(call_hp().empty()); // 5/5 mode tie chooses existing length 2
+  for (auto &a : reads) {
+    a.sequence = left + "GGG" + right;
+    a.ops = cigar(align(a.sequence, ref, .15));
+  }
+  check(call_hp().size() == 1); // pooled fallback is permitted
+  check(realign_homopolymers(ref, ptrs, sites, 2, 5, {}, false, 500).empty());
+  ptrs.resize(4);
+  check(call_hp().empty()); // no sparse post-polishing edits
+  ptrs.clear();
+  check(call_hp().empty());
+  // Read clipping deprives the target of its required local context.
+  reads[0].begin = 50;
+  reads[0].end = ref.size();
+  reads[0].clip_left = 50;
+  reads[0].ops = cigar(align(reads[0].sequence.substr(50), ref.substr(50), .15));
+  ptrs.assign(5, &reads[0]);
+  check(call_hp().empty());
+}

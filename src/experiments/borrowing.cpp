@@ -6,11 +6,12 @@
 #include <limits>
 
 namespace hpc {
-std::vector<double> RunModel::likelihood_scores(char base, const Histogram &h) const {
+std::vector<double> RunModel::likelihood_scores(char base, const Histogram &h,
+                                                bool require_eligible) const {
   auto found = log_probabilities.find(base);
   auto mode = call({h}, 1);
-  if (found == log_probabilities.end() || mode.depth < minimum_depth ||
-      mode.length > found->second.size())
+  if (found == log_probabilities.end() ||
+      (require_eligible && (mode.depth < minimum_depth || mode.length > found->second.size())))
     return {};
   std::vector<double> scores(found->second.size());
   for (size_t i = 0; i < scores.size(); ++i)

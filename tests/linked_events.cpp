@@ -27,6 +27,8 @@ int main() {
           "Equivalent linked and contiguous insertions have one canonical allele");
   }
   auto edits = polish(ref, reads, 1, 5, .9, 500);
+  check(polish(ref, reads, 1, 5, .9, 500, 0, true).empty(),
+        "Frozen master comparison must not silently gain linked-event support");
   check(edits.size() == 1 && edits[0].support == 6 && hpc::apply(ref, edits) == truth,
         "Linked support survives exact allele voting and conflict filtering");
   check(polish(ref, reads, 1, 5, .9, 3).empty(), "Combined allele obeys size cap");

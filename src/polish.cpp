@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT-0
 #include "core.hpp"
+#include "experiments/master_events.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -127,15 +128,15 @@ std::vector<Edit> events(const Alignment &a, const std::string &ref) {
 }
 std::vector<Accepted> polish(const std::string &ref, const std::vector<Alignment> &alns, size_t nt,
                              uint32_t support, double fraction, size_t max_indel,
-                             size_t retain_unique_tiers) {
+                             size_t retain_unique_tiers, bool master_events) {
   std::vector<const Alignment *> ptrs;
   for (auto &a : alns)
     ptrs.push_back(&a);
-  return polish(ref, ptrs, nt, support, fraction, max_indel, retain_unique_tiers);
+  return polish(ref, ptrs, nt, support, fraction, max_indel, retain_unique_tiers, master_events);
 }
 std::vector<Accepted> polish(const std::string &ref, const std::vector<const Alignment *> &alns,
                              size_t nt, uint32_t support, double fraction, size_t max_indel,
-                             size_t retain_unique_tiers) {
+                             size_t retain_unique_tiers, bool master_events) {
   if (retain_unique_tiers > nt)
     throw std::runtime_error("Unique tier count exceeds polishing tier count");
   // Filter before inserting into tree/set storage. Homopolymer noise must not
@@ -149,7 +150,8 @@ std::vector<Accepted> polish(const std::string &ref, const std::vector<const Ali
            encode(ref.substr(e.begin - 1, 1) + e.alt + ref.substr(e.end, 1)).bases;
   };
   for (size_t i = 0; i < alns.size(); ++i)
-    for (const auto &e : events(*alns[i], ref))
+    for (const auto &e :
+         master_events ? experimental::master_events(*alns[i], ref) : events(*alns[i], ref))
       if (eligible(e))
         candidates[e].insert(i);
   // Interval endpoint indexes give the exact same spanning depth without scanning all reads per

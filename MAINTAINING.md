@@ -46,6 +46,22 @@ storage lifetimes and original placement order, not just its final sequence.
 
 ## Development loop
 
+Raw realignment accepts an optional edit-distance upper bound from the valid
+expanded HPC-derived raw trace. Count non-`=` operations before replacing that
+trace; never reuse the bound after changing either sequence or its clipping.
+The original maximum-error cutoff still applies. Tests compare exact traces,
+including repeat-rich and long inputs, because equal distance alone is not
+sufficient for polishing equivalence.
+
+Final-reference CRAM realignments run in batches capped by `--batch-bases` and
+4,096 placements (one oversized read is admitted). Workers own separate
+placements; SAM emission and primary selection remain serial in original order.
+Expanded traces are released after each batch, including failed/cropped records.
+The base budget bounds batching, not total RSS or each worker's alignment scratch.
+
+Use a separate CMake directory such as `build-perf` while a quality experiment
+is using `build/hpc-consensus`; do not rebuild or replace its frozen executable.
+
 1. Preserve a known-good executable before a behavior-preserving change.
 2. Add a small deterministic regression for the affected contract. Prefer
    comparing optimized code with a simple reference algorithm over timing tests.

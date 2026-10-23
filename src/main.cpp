@@ -7,6 +7,7 @@
 #include "io.hpp"
 #include "parallel.hpp"
 #include "experiments/hp_anchors.hpp"
+#include "experiments/refinement.hpp"
 #include "sqStore.H"
 #include "tgTig.H"
 #include "files.H"
@@ -270,6 +271,15 @@ int main(int argc, char **argv) {
         models.emplace(i, RunModel::read(input));
       }
     }
+    std::map<int, RunModel> corroboration_models;
+    for (size_t i = 1; i < o.tiers.size(); ++i) {
+      auto path = o.corroboration_models.find(o.tiers[i].label);
+      if (path != o.corroboration_models.end()) {
+        std::ifstream input(path->second);
+        require(bool(input), "Cannot open corroboration model: " + path->second);
+        corroboration_models.emplace(i, RunModel::read(input));
+      }
+    }
     // Calibration observes the exact accepted HPC votes, before priority drops
     // lower tiers. Exclusions affect this diagnostic only, never consensus.
     std::map<std::string, std::set<size_t>> evidence_sites;
@@ -306,6 +316,10 @@ int main(int argc, char **argv) {
       suffixes.push_back(".region.tsv");
     if (o.consistent_ambiguous)
       suffixes.push_back(".borrowing.tsv");
+    if (!corroboration_models.empty())
+      suffixes.push_back(".corroboration.tsv");
+    if (o.hp_realign)
+      suffixes.push_back(".hp-realignment.tsv");
     if (!o.evidence_sites.empty())
       suffixes.push_back(".run-evidence.tsv");
     if (o.evidence_read_votes)
@@ -338,6 +352,10 @@ int main(int argc, char **argv) {
     auto &fa = outputs[".fasta"];
     auto &calls = outputs[".run-calls.tsv"];
     auto &decisions = outputs[".read-decisions.tsv"];
+    if (!corroboration_models.empty())
+      outputs[".corroboration.tsv"] << "tig\trun\tlower_tier\tbefore\tafter\n";
+    if (o.hp_realign)
+      outputs[".hp-realignment.tsv"] << "tig\tdraft_begin\tdraft_end\tbefore\tafter\ttier\tdepth\n";
     if (extend)
       outputs[".end-extensions.tsv"] << "tig\toriginal_draft_length\tleft_added\tright_added\tleft_"
                                         "candidates\tright_candidates\n";
@@ -353,7 +371,8 @@ int main(int argc, char **argv) {
     if (o.evidence_read_votes)
       outputs[".run-read-votes.tsv"]
           << "tig\trun\tread_id\tname\ttier\tplacements\treverse\thpc_begin\thpc_end"
-             "\top\tlength\tstatus\tquery_raw_begin\tquery_raw_end\n";
+             "\top\tlength\tstatus\tquery_raw_begin\tquery_raw_end"
+             "\tleft_anchor_runs\tright_anchor_runs\tleft_aligned_bases\tright_aligned_bases\n";
     outputs[".template-offsets.tsv"]
         << "tig\toffset\tattempted\tplaced\tvalidation_support\ttolerance\tmethod\n";
     if (o.polish)
@@ -690,15 +709,19 @@ int main(int argc, char **argv) {
       // Release each tier's records after its ambiguous phase has completed.
       std::vector<std::map<size_t, Histogram>> uncertain(o.consistent_ambiguous ? nt : 0);
       const RunModel unmodeled;
+      std::map<size_t, experimental::UncertainCall> corroboration_targets;
+      std::set<size_t> realign_runs;
+      bool active_unique = true;
       size_t active_tier = 0;
       std::vector<Call> selected(ref.size());
       // Bits: 1 threshold-qualified/final, 2 model changed length, 4 pooled,
       // 8 additive higher-tier unique evidence (experimental mode calling),
-      // 16 same-tier ambiguous borrowing changed the final length.
+      // 16 same-tier ambiguous borrowing; 32 lower-tier corroboration changed length.
       std::vector<uint8_t> selected_flags(ref.size());
       auto add_vote = [&](size_t run, uint32_t length, uint32_t count, uint8_t kind) {
         if ((selected_flags[run] & 1) &&
-            !(o.consistent_ambiguous && uncertain[active_tier].count(run)))
+            !(o.consistent_ambiguous && uncertain[active_tier].count(run)) &&
+            !(active_unique && active_tier > 0 && corroboration_targets.count(run)))
           return;
         auto &bin = bins[run];
         vote_classes[run] |= kind;
@@ -724,6 +747,7 @@ int main(int argc, char **argv) {
         bool pooled_phase = phase >= nt;
         size_t tier = phase % nt;
         active_tier = tier;
+        active_unique = !pooled_phase;
         if (pooled_phase && o.ambiguous_fallback) {
           for (const auto &vote : pending[tier])
             add_vote(vote.run, vote.length, vote.count, 1);
@@ -810,12 +834,15 @@ int main(int argc, char **argv) {
                                                                          : "ELIGIBLE";
                   size_t qb = w.a.clip_left + w.rle.offsets.at(q);
                   size_t qe = op == 'D' ? qb : w.a.clip_left + w.rle.offsets.at(q + 1);
+                  auto anchors = experimental::matching_flanks(w.trace, operation);
                   outputs[".run-read-votes.tsv"]
                       << name << '\t' << r << '\t' << w.a.id << '\t' << w.a.name << '\t'
                       << o.tiers[w.a.tier].label << '\t' << w.placements << '\t' << w.a.reverse
                       << '\t' << w.hbegin << '\t' << w.hend << '\t' << op << '\t'
                       << (op == 'D' ? 0 : w.rle.lengths[q]) << '\t' << status << '\t' << qb << '\t'
-                      << qe << '\n';
+                      << qe << '\t' << anchors.first << '\t' << anchors.second << '\t'
+                      << qb - w.a.clip_left << '\t' << w.a.bases().size() - w.a.clip_right - qe
+                      << '\n';
                 }
                 if (op == '=' && ref[r] != 'N' && !partial) {
                   bool eligible = !unflanked && (local_votes.empty() || local_votes[operation]);
@@ -867,6 +894,26 @@ int main(int argc, char **argv) {
           if (it != overflow.end()) {
             it->second[bin.length] = bin.count;
             candidate = call({it->second}, 1, o.experiment_mean);
+          }
+          if (!pooled_phase && tier > 0 && corroboration_targets.count(run)) {
+            auto m = corroboration_models.find(int(tier));
+            if (m != corroboration_models.end()) {
+              Histogram h = it == overflow.end() ? Histogram{{bin.length, bin.count}} : it->second;
+              auto result =
+                  experimental::corroborate(m->second, ref[run], h, corroboration_targets.at(run));
+              if (result) {
+                outputs[".corroboration.tsv"] << name << '\t' << run << '\t' << o.tiers[tier].label
+                                              << '\t' << selected[run].length << '\t' << *result
+                                              << '\n';
+                if (selected[run].length != *result)
+                  selected_flags[run] |= 32;
+                selected[run].length = *result;
+                corroboration_targets.erase(run);
+              }
+            }
+            bin = {};
+            vote_classes[run] = 0;
+            continue;
           }
           if (o.consistent_ambiguous && pooled_phase && (selected_flags[run] & 1)) {
             auto found = uncertain[tier].find(run);
@@ -934,6 +981,22 @@ int main(int argc, char **argv) {
                       ? model->second.estimate_single(ref[run], bin.length, bin.count)
                       : model->second.estimate(ref[run], it->second, candidate.length);
             selected[run] = candidate;
+            if ((!corroboration_models.empty() && tier == 0 && !pooled_phase && qualified) ||
+                o.hp_realign) {
+              Histogram h = it == overflow.end() ? Histogram{{bin.length, bin.count}} : it->second;
+              const auto &calibration = model == models.end() ? unmodeled : model->second;
+              if (!corroboration_models.empty() && tier == 0 && !pooled_phase && qualified) {
+                auto target = experimental::corroboration_target(calibration, ref[run], h);
+                if (target)
+                  corroboration_targets.emplace(run, *target);
+              }
+              if (o.hp_realign) {
+                realign_runs.erase(run);
+                if (qualified &&
+                    (candidate.length != uncalibrated || calibration.uncertain(ref[run], h)))
+                  realign_runs.insert(run);
+              }
+            }
             selected_flags[run] = (qualified ? 1 : 0) | (candidate.length != uncalibrated ? 2 : 0) |
                                   (vote_classes[run] == 3 ? 4 : 0) | (additive ? 8 : 0);
             if (o.consistent_ambiguous && !pooled_phase && qualified) {
@@ -968,6 +1031,7 @@ int main(int argc, char **argv) {
       std::vector<uint8_t>().swap(evidence_mask);
       std::vector<size_t> prefix(ref.size() + 1);
       std::string draft;
+      std::vector<experimental::HpSite> realign_sites;
       // prefix is the exact HPC-run -> draft-base coordinate transform; the
       // sentinel supports reads ending at the final template run boundary.
       for (size_t i = 0; i < ref.size(); ++i) {
@@ -982,12 +1046,15 @@ int main(int argc, char **argv) {
         prefix[i] = draft.size();
         draft.append(c.length, ref[i]);
         prefix[i + 1] = draft.size();
+        if (realign_runs.count(i))
+          realign_sites.push_back({prefix[i], prefix[i + 1], ref[i]});
         calls << name << '\t' << i << '\t' << prefix[i] << '\t' << prefix[i + 1] << '\t' << ref[i]
               << '\t' << c.length << '\t'
               << (c.tier < 0 ? "NO_EVIDENCE" : o.tiers[c.tier % o.tiers.size()].label) << '\t'
               << c.depth << '\t' << c.peak << '\t'
               << (c.tier < 0                 ? "NONE"
                   : (selected_flags[i] & 16) ? "UNIQUE_BORROWED"
+                  : (selected_flags[i] & 32) ? "UNIQUE_CORROBORATED"
                   : (selected_flags[i] & 8)  ? "UNIQUE_ADDITIVE"
                   : (selected_flags[i] & 4)  ? "POOLED"
                   : ambiguous_call           ? "AMBIGUOUS"
@@ -995,6 +1062,7 @@ int main(int argc, char **argv) {
               << '\n';
       }
       std::vector<Call>().swap(selected);
+      realign_runs.clear();
       std::vector<uint8_t>().swap(selected_flags);
       memory_stage("draft called");
       size_t crop_begin = 0, crop_end = draft.size();
@@ -1046,9 +1114,14 @@ int main(int argc, char **argv) {
             // Prototype: realign the layout interval when its HPC trace has errors.
             if (w.trace.find_first_of("XID") != std::string::npos) {
               w.raw_alignment_attempted = true;
+              // The lifted HPC trace already aligns these exact raw intervals.
+              // Its unit-cost edit count bounds the optimum without imposing
+              // new anchors or changing the accepted maximum error rate.
+              size_t bound =
+                  std::count_if(w.a.ops.begin(), w.a.ops.end(), [](char op) { return op != '='; });
               w.a.ops = align(w.a.bases().substr(w.a.clip_left, w.a.bases().size() - w.a.clip_left -
                                                                     w.a.clip_right),
-                              draft.substr(w.a.begin, w.a.end - w.a.begin), o.max_error);
+                              draft.substr(w.a.begin, w.a.end - w.a.begin), o.max_error, bound);
             }
             size_t nm;
             md(w.a, draft, nm);
@@ -1091,6 +1164,10 @@ int main(int argc, char **argv) {
                                        << added.right << '\t' << added.left_candidates << '\t'
                                        << added.right_candidates << '\n';
         crop_end += added.left + added.right;
+        for (auto &site : realign_sites) {
+          site.begin += added.left;
+          site.end += added.left;
+        }
         // Interior traces were already validated; a uniform coordinate shift
         // does not require another chromosome-wide decode/MD pass.
         for (const auto &r : terminal)
@@ -1103,6 +1180,7 @@ int main(int argc, char **argv) {
                   << added.right_candidates << ")\n";
       }
       std::vector<Accepted> edits;
+      size_t hp_edit_count = 0;
       if (o.polish) {
         write_fasta(outputs[".draft.fasta"], name,
                     std::string_view(draft).substr(crop_begin, crop_end - crop_begin));
@@ -1115,9 +1193,37 @@ int main(int argc, char **argv) {
               w.a.tier += o.tiers.size();
             alns.push_back(&w.a);
           }
-        edits =
-            polish(draft, alns, o.tiers.size() * (o.ambiguous_fallback ? 2 : 1), o.polish_support,
-                   o.polish_fraction, o.max_indel, o.retain_higher_unique ? o.tiers.size() : 0);
+        edits = polish(draft, alns, o.tiers.size() * (o.ambiguous_fallback ? 2 : 1),
+                       o.polish_support, o.polish_fraction, o.max_indel,
+                       o.retain_higher_unique ? o.tiers.size() : 0, o.master_events);
+        if (o.hp_realign) {
+          auto hp_edits = experimental::realign_homopolymers(
+              draft, alns, realign_sites, o.tiers.size(), o.min_support, models,
+              o.ambiguous_fallback, o.max_indel, corroboration_models, o.hp_flank_bases);
+          // Non-HPC edits retain priority. Never apply overlapping independent
+          // alleles or let a crop split a replacement; all coordinates are draft.
+          std::vector<Accepted> accepted_hp;
+          for (const auto &e : hp_edits) {
+            if (o.region && (e.edit.begin <= crop_begin || e.edit.end >= crop_end))
+              continue;
+            auto next =
+                std::lower_bound(edits.begin(), edits.end(), e.edit.begin,
+                                 [](const Accepted &x, size_t p) { return x.edit.end < p; });
+            if (next != edits.end() && next->edit.begin <= e.edit.end)
+              continue;
+            accepted_hp.push_back(e);
+            outputs[".hp-realignment.tsv"]
+                << name << '\t' << e.edit.begin << '\t' << e.edit.end << '\t'
+                << e.edit.end - e.edit.begin << '\t' << e.edit.alt.size() << '\t'
+                << o.tiers[e.tier % o.tiers.size()].label << '\t' << e.depth << '\n';
+          }
+          edits.insert(edits.end(), accepted_hp.begin(), accepted_hp.end());
+          hp_edit_count = accepted_hp.size();
+          std::sort(edits.begin(), edits.end(),
+                    [](const Accepted &a, const Accepted &b) { return a.edit < b.edit; });
+          std::cerr << "HP local realignment: " << realign_sites.size() << " targets, "
+                    << accepted_hp.size() << " edits\n";
+        }
         for (auto &w : work)
           if (w.a.tier >= int(o.tiers.size()))
             w.a.tier -= o.tiers.size();
@@ -1130,7 +1236,7 @@ int main(int argc, char **argv) {
                                        return e.edit.begin <= crop_begin || e.edit.end >= crop_end;
                                      }),
                       edits.end());
-        n_edits += edits.size();
+        n_edits += edits.size() - hp_edit_count;
         memory_stage("polishing complete");
         for (const auto &e : edits) {
           // VCF anchor indels with the preceding reference base, in draft coordinates.
@@ -1161,8 +1267,20 @@ int main(int argc, char **argv) {
       write_fasta(fa, name, final);
       refs.emplace_back(name, final.size());
       if (!o.cram.empty()) {
-        for (auto &w : work)
-          if (w.reason.empty()) {
+        // Realign independently in bounded batches, then emit in original order.
+        // This preserves first-successful-placement primary selection and avoids
+        // retaining expanded final traces for an entire chromosome at once.
+        for (size_t batch = 0; batch < work.size();) {
+          size_t end = batch, bases = 0;
+          do {
+            bases += work[end].a.bases().size();
+            ++end;
+          } while (end < work.size() && end - batch < 4096 && bases < o.batch_bases);
+          std::vector<uint8_t> attempted(end - batch, 0);
+          parallel(end - batch, o.threads, [&](size_t j) {
+            auto &w = work[batch + j];
+            if (!w.reason.empty())
+              return;
             bool touches = false;
             for (auto &e : edits)
               if (e.edit.begin <= w.a.end && e.edit.end >= w.a.begin)
@@ -1173,7 +1291,7 @@ int main(int argc, char **argv) {
             // needs a new trace and fresh NM/MD against the final reference.
             try {
               if (touches) {
-                ++base_alignments;
+                attempted[j] = 1;
                 // Realign against the polished context before rebasing to the crop.
                 auto target =
                     (o.region ? region_reference : final).substr(w.a.begin, w.a.end - w.a.begin);
@@ -1183,6 +1301,18 @@ int main(int argc, char **argv) {
                           target, o.max_error);
                 w.a.packed_ops = false;
               }
+            } catch (const std::bad_alloc &) {
+              throw;
+            } catch (const std::exception &e) {
+              w.reason = "FINAL_ALIGNMENT_FAILED";
+            }
+          });
+          base_alignments += std::count(attempted.begin(), attempted.end(), uint8_t(1));
+          for (size_t i = batch; i < end; ++i) {
+            auto &w = work[i];
+            if (!w.reason.empty())
+              continue;
+            try {
               if (o.region && !crop_alignment(w.a, final_begin, final_end))
                 continue;
               size_t nm;
@@ -1207,6 +1337,11 @@ int main(int argc, char **argv) {
               w.reason = "FINAL_ALIGNMENT_FAILED";
             }
           }
+          // Also release traces for failed or region-cropped placements.
+          for (size_t i = batch; i < end; ++i)
+            std::string().swap(work[i].a.ops);
+          batch = end;
+        }
       }
       for (auto &w : work) {
         if (!w.reason.empty())

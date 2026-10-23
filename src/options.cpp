@@ -72,6 +72,9 @@ Options parse_options(int argc, char **argv) {
              "--region TIG:BEGIN-END  One tig, zero-based half-open uncompressed draft bases\n"
              "--region-flank N      Context in bases/runs (default 100000; region mode only)\n"
              "--experiment-run-mean  Diagnostic rounded-mean run caller (default: mode)\n"
+             "--experiment-corroboration-model LABEL=FILE  Frozen lower-tier corroboration rule\n"
+             "--experiment-hp-realign  Rebuild uncertain HP evidence by local raw realignment\n"
+             "--experiment-master-events  Use master's unlinked event extractor for comparisons\n"
              "--experiment-consistent-ambiguous  Bounded same-tier ambiguous run evidence\n"
              "--experiment-retain-higher-unique  Retain higher unique votes on unique-tier "
              "fallback;\n"
@@ -136,7 +139,18 @@ Options parse_options(int argc, char **argv) {
       o.polish = true;
     else if (a == "--experiment-run-mean")
       o.experiment_mean = true;
-    else if (a == "--experiment-consistent-ambiguous")
+    else if (a == "--experiment-hp-realign")
+      o.hp_realign = true;
+    else if (a == "--experiment-master-events")
+      o.master_events = true;
+    else if (a == "--experiment-corroboration-model") {
+      auto v = value();
+      auto equal = v.find('=');
+      require(equal != std::string::npos && equal > 0 && equal + 1 < v.size(),
+              "Expected --experiment-corroboration-model LABEL=FILE");
+      require(o.corroboration_models.emplace(v.substr(0, equal), v.substr(equal + 1)).second,
+              "Duplicate corroboration model");
+    } else if (a == "--experiment-consistent-ambiguous")
       o.consistent_ambiguous = true;
     else if (a == "--experiment-retain-higher-unique")
       o.retain_higher_unique = true;
@@ -208,6 +222,19 @@ Options parse_options(int argc, char **argv) {
   require(!o.input.empty() && !o.output.empty() && !o.tiers.empty(),
           "Require --import, --output and at least one --tier; see --help");
   require(o.polish_fraction > 0.5, "Polishing fraction must exceed 0.5");
+  require(!o.hp_realign || o.polish, "HP realignment requires --polish-non-hpc");
+  if (o.hp_realign || !o.corroboration_models.empty())
+    require(!o.retain_higher_unique && !o.consistent_ambiguous && !o.experiment_mean &&
+                !o.terminal_hp_filter,
+            "Refinement cannot combine with retention, borrowing, mean, or terminal filtering");
+  if (!o.corroboration_models.empty()) {
+    require(o.min_support == 5 && o.model_paths.count(o.tiers.front().label),
+            "Frozen corroboration rule requires support 5 and a first-tier model");
+    for (const auto &[label, path] : o.corroboration_models)
+      require(std::any_of(o.tiers.begin() + 1, o.tiers.end(),
+                          [&](const auto &tier) { return tier.label == label; }),
+              "Corroboration model must name a lower tier: " + label);
+  }
   require(o.model_paths.empty() || !o.experiment_mean,
           "--tier-model cannot be combined with --experiment-run-mean");
   require(!o.retain_higher_unique || !o.experiment_mean,

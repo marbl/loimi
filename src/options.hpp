@@ -16,6 +16,10 @@ struct Options {
   bool terminal_hp_filter = false;  // Experimental interior terminal-run exclusion.
   size_t hp_flank_bases = 0;        // Experimental aligned-query flank length; zero disables.
   std::map<std::string, std::string> model_paths;
+  // Corroboration-only calibrations never change ordinary tier calls.
+  std::map<std::string, std::string> corroboration_models;
+  bool hp_realign = false;
+  bool master_events = false; // Comparison harness: freeze non-HPC polishing to master.
   std::vector<Tier> tiers;
   unsigned threads = 1, min_support = 5, polish_support = 5;
   size_t batch_bases = 8000000;

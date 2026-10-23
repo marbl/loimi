@@ -8,6 +8,12 @@ int main() {
     if (!v)
       throw std::runtime_error("HP flank contract failed");
   };
+  using hpc::experimental::matching_flanks;
+  check(matching_flanks("===X=====I==", 6) == std::make_pair(size_t(2), size_t(2)));
+  check(matching_flanks("=====", 0) == std::make_pair(size_t(0), size_t(4)));
+  check(matching_flanks("=====", 2, 1) == std::make_pair(size_t(1), size_t(1)));
+  check(matching_flanks("===X===", 3) == std::make_pair(size_t(0), size_t(0)));
+  check(matching_flanks("", 0) == std::make_pair(size_t(0), size_t(0)));
   check(!has_run_flanks(0, 5, 10, 100));
   check(!has_run_flanks(4, 5, 10, 100));
   check(has_run_flanks(1, 5, 10, 100));

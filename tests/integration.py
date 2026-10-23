@@ -369,6 +369,17 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
     assert sequence(root / "fix-polish.fasta") == "ACATACGT"
     assert sequence(root / "fix-polish.draft.fasta") == "ACGTACGT"
     assert json.loads((root / "fix-polish.summary.json").read_text())["non_hpc_edits"] == 1
+    if shutil.which("samtools"):
+        # Final-reference realignment must be independent of workers and batch
+        # boundaries, including SAM order/primary flags and all derived tags.
+        expected = run(["samtools", "view", root / "fix.cram"]).stdout
+        for batch in (1, 8000000):
+            label = f"fix-parallel-{batch}"
+            run(fixbase + ["--output", root / label, "--polish-non-hpc",
+                           "--threads", "4", "--batch-bases", str(batch),
+                           "--cram", root / f"{label}.cram"])
+            assert run(["samtools", "view", root / f"{label}.cram"]).stdout == expected
+            assert sequence(root / f"{label}.fasta") == sequence(root / "fix-polish.fasta")
     args = fixbase + ["--region", "tig00000001:1-7", "--polish-non-hpc", "--output", root / "fix-region"]
     if shutil.which("samtools"):
         args += ["--cram", root / "fix-region.cram"]

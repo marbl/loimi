@@ -1,5 +1,38 @@
 # Maintenance validation — 2026-10-14
 
+## Alignment performance experiment — 2026-10-21
+
+Separate Release executable: `build-perf/hpc-consensus`. The original
+`build/hpc-consensus` was not rebuilt; its SHA256 remains
+`1d542f3881d318674eb0224cd227d255f3169e9a8e9f972d97e825d8e27ea4f6`.
+Changes: bound initial raw Edlib search by the existing valid raw trace's edit
+count; parallelize final-reference CRAM realignment in bounded batches with
+ordered serial emission. No voting or scoring policy changes.
+
+Four-thread polishing+CRAM comparisons on the 224 Mb-site fixture:
+
+| Order | Before wall | After wall | Before OS peak RSS | After OS peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| Before, after | 21.91 s | 14.86 s | 296.2 MiB | 297.5 MiB |
+| After, before | 25.54 s | 15.55 s | 310.1 MiB | 283.7 MiB |
+
+Wall time decreased 32–39%; user CPU decreased from 65.61/66.87 seconds to
+43.26/43.29 seconds. Other quality runs and verification work were active, so
+these are preliminary measurements under contention, not isolated performance
+bounds. This fixture has zero accepted polishing edits and primarily exercises
+the tighter bound, not final-reference realignment. All text artifacts and
+decoded SAM records match byte-for-byte; CRAM integrity checks pass.
+The first pair predates the cleanup that also releases failed/cropped traces;
+the reverse-order pair uses the final executable (hash recorded in its report).
+
+Release and ASan/UBSan suites each pass all 12 tests. New coverage includes
+1,000 seeded random bound/trace comparisons, a 20-kb noisy traceback, unchanged
+error-rate rejection, and native serial/parallel CRAM parity with both one-read
+and multi-read batches. These checks do not establish whole-chromosome QV or RAM.
+Artifacts: `../hg002-test/perf-alignment/` relative to the repository root.
+
+## Earlier maintenance baseline
+
 Baseline: the executable immediately before this maintenance pass, **not** the
 mature Verkko caller or the older high-memory prototype. Same native libraries,
 Release optimization, three ordered tiers, LA Revio model, four threads.

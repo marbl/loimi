@@ -23,7 +23,10 @@ std::string reverse_complement(std::string s);
 // Each operation consumes one query and/or reference base: = X I D.
 // Global unit-cost alignment, capped at ceil(max_error * max(sequence lengths)).
 // Throws on failed alignment. Returned traces are expanded, not CIGAR strings.
-std::string align(const std::string &query, const std::string &reference, double max_error);
+// Optional upper bound must come from a valid end-to-end alignment of these
+// exact sequences. It narrows search only; the error-rate acceptance stays intact.
+std::string align(const std::string &query, const std::string &reference, double max_error,
+                  size_t distance_bound = SIZE_MAX);
 // Centered local-quality gate in expanded HPC alignment-operation space.
 // X/I/D all count as errors. Terminal windows are truncated to the trace.
 // Empty means every matching operation is eligible (including exact traces).
@@ -67,6 +70,10 @@ public:
   static RunModel read(std::istream &input);
   uint32_t estimate(char base, const Histogram &observations, uint32_t fallback) const;
   uint32_t estimate_single(char base, uint32_t observed, uint32_t depth) const;
+  // Diagnostic log likelihoods in ascending true-length order; empty when the
+  // model/depth/modal-length eligibility checks fail. Not posterior probabilities.
+  std::vector<double> likelihood_scores(char base, const Histogram &observations,
+                                        bool require_eligible = true) const;
   // Experimental same-technology borrowing. An empty model uses modal support.
   // Unique calls with likelihood ratio >=100 (or modal support >=90%) are
   // protected. Borrow <=min(5, unique_depth/2) equivalent ambiguous votes only
@@ -76,7 +83,6 @@ public:
                   uint32_t current) const;
 
 private:
-  std::vector<double> likelihood_scores(char base, const Histogram &observations) const;
   size_t observed_max = 0;
   uint32_t minimum_depth = 5;
   std::map<char, std::vector<std::vector<double>>> log_probabilities;
@@ -140,15 +146,17 @@ struct Accepted {
 };
 std::vector<Accepted> polish(const std::string &ref, const std::vector<Alignment> &alns,
                              size_t tiers, uint32_t support, double fraction, size_t max_indel,
-                             size_t retain_unique_tiers = 0);
+                             size_t retain_unique_tiers = 0, bool master_events = false);
 // Borrowed alignments must remain alive for this call. Callers prefilter consensus
 // eligibility; returned edits are ordered, non-overlapping, and in draft space.
 // Optional experimental retention: ranks [0, retain_unique_tiers) are unique.
 // A qualified unique tier includes higher ranks' evidence in fraction/strand
 // checks. Its own depth must still qualify. Ambiguous fallback is unchanged.
+// master_events freezes the older unlinked event extractor for controlled
+// comparisons against master; default branch behavior is unchanged.
 std::vector<Accepted> polish(const std::string &ref, const std::vector<const Alignment *> &alns,
                              size_t tiers, uint32_t support, double fraction, size_t max_indel,
-                             size_t retain_unique_tiers = 0);
+                             size_t retain_unique_tiers = 0, bool master_events = false);
 std::string apply(const std::string &ref, const std::vector<Accepted> &edits);
 // Map a draft boundary through sorted edits. Points inside a replacement map to
 // its start; a point at an insertion maps after inserted bases. Touching reads

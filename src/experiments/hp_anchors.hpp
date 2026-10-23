@@ -1,8 +1,25 @@
 // SPDX-License-Identifier: MIT-0
 #pragma once
 #include <cstddef>
+#include <string>
+#include <utility>
 
 namespace hpc::experimental {
+// Diagnostic only: consecutive matching HPC operations immediately outside
+// the focal run, capped to bound work per requested site. An indel or mismatch
+// breaks the anchor. These are HPC runs, not raw bases or mapping uniqueness.
+inline std::pair<std::size_t, std::size_t> matching_flanks(const std::string &ops,
+                                                         std::size_t pos,
+                                                         std::size_t cap = 32) {
+  if (pos >= ops.size() || ops[pos] != '=')
+    return {0, 0};
+  std::size_t left = 0, right = 0;
+  while (left < cap && left < pos && ops[pos - left - 1] == '=')
+    ++left;
+  while (right < cap && right + 1 < ops.size() - pos && ops[pos + right + 1] == '=')
+    ++right;
+  return {left, right};
+}
 // Minimal first-stage filter, NOT a test of multi-base alignment quality.
 // A length observation at an interior template run needs observed query runs
 // on both sides. Natural/clipped read-terminal runs are otherwise censored.

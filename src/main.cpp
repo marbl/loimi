@@ -802,6 +802,13 @@ int main(int argc, char **argv) {
                                : std::vector<uint8_t>{};
               size_t q = 0, r = w.hbegin, operation = 0;
               bool filtered_read = false;
+              // Recover flank distance lost ONLY at supplied template boundaries.
+              // Genuine read-end/package trimming stays excluded. Artificial
+              // prefix limits in region mode cannot manufacture right context.
+              size_t left_context = w.hbegin == 0 ? w.a.clip_left - w.original_clip_left : 0;
+              size_t right_context = w.hend == ref.size() && ref.size() == complete_template_size
+                                         ? w.a.clip_right - w.original_clip_right
+                                         : 0;
               for (char op : w.trace) {
                 // Original raw clipping may cut a run. Do not vote with a truncated length.
                 bool partial = (q == 0 && w.a.clip_left > 0 &&
@@ -812,13 +819,14 @@ int main(int argc, char **argv) {
                 bool unflanked = o.terminal_hp_filter && !experimental::has_run_flanks(
                                                              q, w.rle.bases.size(), r, ref.size());
                 if (o.hp_flank_bases && op == '=') {
-                  // Use the aligned, clipped query rather than whole-read length:
-                  // soft-clipped bases must not qualify a censored observation.
+                  // Template-induced clipping is not a biological read end.
+                  // Retain 500-bp (or configured) read-end protection while
+                  // allowing real overhangs to support the terminal draft.
                   unflanked |= !experimental::has_span_flanks(
                       w.rle.offsets.at(q), w.rle.offsets.at(q + 1), w.rle.offsets.back(),
                       o.hp_flank_bases, operation > 0 && w.trace[operation - 1] == '=',
                       operation + 1 < w.trace.size() && w.trace[operation + 1] == '=', r == 0,
-                      r + 1 == ref.size());
+                      r + 1 == ref.size(), left_context, right_context);
                 }
                 // Stream only requested sites, retaining no per-read trace table.
                 // A row reports evidence eligibility, not whether this tier won.

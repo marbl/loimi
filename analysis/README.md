@@ -1,5 +1,36 @@
 # Isolated consensus experiments
 
+## Boundary-aware flank filtering (2026-10-26)
+
+The 500-bp filter now counts usable query overhangs removed by template-boundary
+alignment when measuring distance to a read end. Previously it measured only
+the template-clipped query and erased terminal run evidence, which could make
+all extension anchors fail. The outward exact-template-run waiver is unchanged.
+Overhangs contribute distance only: adjacent HPC matches, local alignment-quality
+filtering, partial-run protection, tier ordering, and extension support thresholds
+are unchanged. Packaged/trimming clips are excluded; internal alignment endpoints
+get no bonus. Region-mode artificial right prefix boundaries get no bonus either.
+The change applies even with end extension disabled, so the terminal draft itself
+can be called correctly. It does not exempt a broad terminal region from filtering.
+
+`native-end-flanks` tests forward/reverse boundary reads, both/left/right/disabled
+extension, 500-bp filtering of high-priority short interior reads, complete run
+recovery, and CRAM validation. Unit tests exercise exact distance thresholds and
+missing adjacent anchors. The paired biological tail test is kept outside Git
+in `hg002-test/end-flank-regression/`; results there distinguish synthetic
+both-end guarantees from recovery of the real right telomere.
+
+Completed biological regression with 500-bp flanks and HP realignment enabled,
+corroboration disabled to match the reported run: right extension 0 -> 1,934 bp,
+79 anchored molecules. All 310 unsupported right-terminal runs regained evidence;
+315 changed run records are confined to the final 316 HPC runs. Interior run
+evidence is identical. Total unsupported fixture runs fell 705 -> 395; this does
+not claim resolution of the artificial left fixture boundary. `seqtk telo` changed
+from no terminal call to a 2,080-bp right telomere. CRAM quickcheck and calmd passed
+with 34,151 records. All 16 Release and sanitizer suites pass, and the old binary
+fails the new native regression. Full-chromosome QV and actual left-telomere
+recovery were not retested. Full results: ignored `end-flank-regression/validation.json`.
+
 ## Full-chromosome trial with linked-event grouping
 
 The combined HP policies and linked-event grouping are present on this branch.

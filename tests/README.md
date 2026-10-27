@@ -5,8 +5,30 @@
 After building, run from the module directory:
 
 ```sh
-ctest --test-dir build --output-on-failure
+make test
 ```
+
+Add `VERKKO_ROOT=/path/to/verkko` for a separate checkout, and set `CXX`
+externally if the default compiler is unsuitable.
+
+`hp-refinement` covers model uncertainty, tier selection, ambiguous fallback
+and rebuilt-evidence flank filtering. `hp-flanks` checks exact distance limits,
+adjacent-match requirements, and usable overhang context at either end.
+`native-hp-refinement` exercises the default combined behavior, independent
+disable switches, a genuine corrected run, and final-reference CRAM output.
+`native-end-flanks` verifies that default 500-bp filtering excludes short
+interior votes while allowing extension at both ends, including reverse reads.
+
+`linked-events` checks equivalent split/contiguous CIGAR representations,
+the independent-event disable mode, and 2,000 generated haplotypes whose
+normalized edits must exactly reconstruct the read. Grouping cannot invent
+alleles by joining events from different reads.
+
+The older tiny `native-package` and `native-offset` fixtures explicitly disable
+HP flank filtering and refinement because they lack 500-bp query context.
+The dedicated HP/end fixtures exercise the production defaults instead.
+`maintenance` also verifies default CLI configuration, disable/re-enable
+controls, and the old HP option compatibility aliases.
 
 `core` tests run encoding (including long homopolymers), reverse complement,
 name glob ordering, run-mode/tie selection, tier fallback/support, alignment

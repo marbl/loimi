@@ -23,6 +23,37 @@ template <class F> static void rejects(F action) {
 }
 int main() {
   using namespace hpc;
+  auto options = [](std::vector<std::string> extra) {
+    std::vector<std::string> arguments{"hpc-consensus", "--import", "unused.cnspack", "--output",
+                                       "unused",        "--tier",   "all=*"};
+    arguments.insert(arguments.end(), extra.begin(), extra.end());
+    std::vector<char *> argv;
+    for (auto &arg : arguments)
+      argv.push_back(arg.data());
+    return parse_options(int(argv.size()), argv.data());
+  };
+  auto fast = options({});
+  check(fast.hp_flank_bases == 500 && !fast.hp_realign && !fast.polish && !fast.extend,
+        "Fast mode filters flanks without enabling raw realignment or extension");
+  auto defaults = options({"--polish-non-hpc"});
+  check(defaults.hp_realign && defaults.hp_flank_bases == 500 && defaults.linked_events &&
+            !defaults.no_extend,
+        "Polishing defaults include HP refinement, linked events and extension");
+  auto disabled = options({"--polish-non-hpc", "--no-hp-realign", "--no-hp-flank-filter",
+                           "--no-linked-events", "--no-extend-ends"});
+  check(!disabled.hp_realign && !disabled.hp_flank_bases && !disabled.linked_events &&
+            disabled.no_extend,
+        "Each promoted feature can be independently disabled");
+  auto explicit_flags =
+      options({"--polish-non-hpc", "--no-hp-realign", "--hp-realign", "--no-hp-flank-filter",
+               "--hp-flank-bases", "300", "--no-linked-events", "--linked-events"});
+  check(explicit_flags.hp_realign && explicit_flags.hp_flank_bases == 300 &&
+            explicit_flags.linked_events,
+        "Explicit enable switches and custom flank values override earlier disables");
+  auto aliases = options(
+      {"--polish-non-hpc", "--experiment-hp-realign", "--experiment-hp-flank-bases", "500"});
+  check(aliases.hp_realign && aliases.hp_flank_bases == 500,
+        "Old HP spellings remain compatibility aliases");
   std::vector<unsigned> visited(1000);
   parallel(visited.size(), 4, [&](size_t i) { ++visited[i]; });
   for (auto count : visited)

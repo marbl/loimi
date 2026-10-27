@@ -18,7 +18,11 @@ tools = verkko / "build/bin"
 
 def run(args, ok=True):
     """Assert success (or an expected failure), preserving tool logs on failure."""
-    result = subprocess.run(list(map(str, args)), capture_output=True, text=True)
+    # Legacy tiny fixtures cannot supply the production 500-bp flank.
+    if str(args[0]) == str(exe):
+        args = [*args, "--no-hp-flank-filter", "--no-hp-realign"]
+    # Native package writers also emit mapping sidecars in their working directory.
+    result = subprocess.run(list(map(str, args)), capture_output=True, text=True, cwd=root)
     if (result.returncode == 0) != ok:
         raise AssertionError(f"{args}\n{result.stdout}\n{result.stderr}")
     return result

@@ -10,7 +10,10 @@ tools = pathlib.Path(sys.argv[2]) / 'build/bin'
 
 
 def run(args):
-    p = subprocess.run(list(map(str, args)), capture_output=True, text=True)
+    # Legacy tiny fixtures cannot supply the production 500-bp flank.
+    if str(args[0]) == str(exe):
+        args = [*args, "--no-hp-flank-filter", "--no-hp-realign"]
+    p = subprocess.run(list(map(str, args)), capture_output=True, text=True, cwd=root)
     assert p.returncode == 0, p.stdout + p.stderr
     return p.stdout + p.stderr
 

@@ -14,7 +14,9 @@ struct Options {
   std::string evidence_sites, evidence_exclude_reads;
   bool evidence_read_votes = false; // Opt-in per-placement diagnostic; never changes votes.
   bool terminal_hp_filter = false;  // Experimental interior terminal-run exclusion.
-  size_t hp_flank_bases = 0;        // Experimental aligned-query flank length; zero disables.
+  bool hp_realign = true;           // Rebuild uncertain HP evidence in raw alignments.
+  size_t hp_flank_bases = 500;      // Raw-query flank length; zero disables.
+  bool linked_events = true;        // Group normalization-linked polishing alleles.
   std::map<std::string, std::string> model_paths;
   std::vector<Tier> tiers;
   unsigned threads = 1, min_support = 5, polish_support = 5;

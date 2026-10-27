@@ -32,7 +32,7 @@ These instructions apply throughout this repository.
 
 ## Verification and change boundaries
 
-- Run the CMake build and `ctest --test-dir build --output-on-failure` after
+- Run `make` and `make test` after
   code changes. Add regression coverage for new behavior and fixed edge cases.
 - For behavior-preserving performance changes, compare consensus, diagnostics,
   and decoded alignments against the previous implementation where practical.

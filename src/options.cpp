@@ -79,8 +79,10 @@ Options parse_options(int argc, char **argv) {
              "--evidence-sites FILE  Export all-tier HPC histograms at TIG RUN rows (zero-based)\n"
              "--evidence-read-votes  Also trace per-read evidence at --evidence-sites\n"
              "--experiment-terminal-hp-filter  Exclude unflanked query-terminal HP votes\n"
-             "--experiment-hp-flank-bases N  Require N raw query bases and adjacent HPC matches on "
+             "--hp-flank-bases N    Require N raw query bases and adjacent HPC matches (default "
+             "500) on "
              "each side\n"
+             "--no-hp-flank-filter Disable the raw-query flank requirement\n"
              "--evidence-exclude-reads FILE  Read IDs excluded only from diagnostic histograms\n"
              "--unique-only        Disable default fallback to multiply placed reads\n"
              "--ambiguous-fallback Pool within tiers if no unique tier qualifies (default)\n"
@@ -94,6 +96,9 @@ Options parse_options(int argc, char **argv) {
              "--no-hpc-filter        Disable local vote filtering for comparisons\n"
              "--threads N (default 1; parallel alignments within each tig)\n"
              "--batch-bases N (default 8000000; raw bases per HPC alignment batch)\n"
+             "--hp-realign         Re-estimate uncertain runs during polishing (default)\n"
+             "--no-hp-realign      Disable HP re-estimation during polishing\n"
+             "--no-linked-events   Normalize polishing events independently\n"
              "--polish-non-hpc      Optional conservative correction\n"
              "--extend-ends         Coverage-supported ends (also enabled by polishing)\n"
              "--no-extend-ends      Preserve template boundaries, including with polishing\n"
@@ -146,7 +151,17 @@ Options parse_options(int argc, char **argv) {
       o.evidence_read_votes = true;
     else if (a == "--experiment-terminal-hp-filter")
       o.terminal_hp_filter = true;
-    else if (a == "--experiment-hp-flank-bases")
+    else if (a == "--hp-realign" || a == "--experiment-hp-realign")
+      o.hp_realign = true;
+    else if (a == "--no-hp-realign")
+      o.hp_realign = false;
+    else if (a == "--no-linked-events")
+      o.linked_events = false;
+    else if (a == "--linked-events")
+      o.linked_events = true;
+    else if (a == "--no-hp-flank-filter")
+      o.hp_flank_bases = 0;
+    else if (a == "--hp-flank-bases" || a == "--experiment-hp-flank-bases")
       o.hp_flank_bases = parse_positive_integer(value());
     else if (a == "--evidence-exclude-reads")
       o.evidence_exclude_reads = value();
@@ -207,6 +222,9 @@ Options parse_options(int argc, char **argv) {
   }
   require(!o.input.empty() && !o.output.empty() && !o.tiers.empty(),
           "Require --import, --output and at least one --tier; see --help");
+  // Preserve expansion-only mode: default HP refinement is part of polishing,
+  // not an implicit request to align reads in fast runs.
+  o.hp_realign = o.hp_realign && o.polish;
   require(o.polish_fraction > 0.5, "Polishing fraction must exceed 0.5");
   require(o.model_paths.empty() || !o.experiment_mean,
           "--tier-model cannot be combined with --experiment-run-mean");

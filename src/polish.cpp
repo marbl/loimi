@@ -9,6 +9,38 @@
 #include <tuple>
 
 namespace hpc {
+namespace {
+// Canonicalize a complete read-supported replacement, not independent pieces
+// of a haplotype. Trim shared sequence before left-normalizing a pure indel.
+Edit normalize(Edit e, const std::string &ref) {
+  while (e.end > e.begin && !e.alt.empty() && ref[e.end - 1] == e.alt.back()) {
+    --e.end;
+    e.alt.pop_back();
+  }
+  size_t shared = 0;
+  while (e.begin + shared < e.end && shared < e.alt.size() &&
+         ref[e.begin + shared] == e.alt[shared])
+    ++shared;
+  e.begin += shared;
+  e.alt.erase(0, shared);
+  if (e.begin == e.end && !e.alt.empty()) {
+    size_t shift = 0;
+    while (e.begin && ref[e.begin - 1] == e.alt[e.alt.size() - 1 - shift]) {
+      shift = (shift + 1) % e.alt.size();
+      --e.begin;
+      --e.end;
+    }
+    if (shift)
+      std::rotate(e.alt.begin(), e.alt.end() - shift, e.alt.end());
+  } else if (e.alt.empty()) {
+    while (e.begin && e.end > e.begin && ref[e.begin - 1] == ref[e.end - 1]) {
+      --e.begin;
+      --e.end;
+    }
+  }
+  return e;
+}
+} // namespace
 bool Edit::operator<(const Edit &o) const {
   return std::tie(begin, end, alt) < std::tie(o.begin, o.end, o.alt);
 }
@@ -39,7 +71,7 @@ bool crop_alignment(Alignment &a, size_t begin, size_t end) {
   a.packed_ops = true;
   return true;
 }
-std::vector<Edit> events(const Alignment &a, const std::string &ref) {
+static std::vector<Edit> independent_events(const Alignment &a, const std::string &ref) {
   // Coalesce consecutive non-matches into a single replacement allele. This
   // allows substitutions, indels, and combined events to use one voting policy.
   std::string expanded;
@@ -88,15 +120,73 @@ std::vector<Edit> events(const Alignment &a, const std::string &ref) {
     throw std::runtime_error("Invalid alignment trace");
   return out;
 }
+std::vector<Edit> events(const Alignment &a, const std::string &ref, bool linked_events) {
+  if (!linked_events)
+    return independent_events(a, ref);
+  // Preserve raw alignment order while grouping linked changes. Independently
+  // left-normalizing two insertions can move both to the same coordinate and
+  // falsely turn one supported haplotype into competing alleles.
+  std::string expanded;
+  if (a.packed_ops)
+    expanded = expand_cigar(a.ops);
+  const auto &ops = a.packed_ops ? expanded : a.ops;
+  struct Linked {
+    Edit raw, normalized;
+  };
+  std::vector<Linked> linked;
+  size_t q = a.clip_left, r = a.begin;
+  for (size_t i = 0; i < ops.size();) {
+    if (ops[i] == '=') {
+      ++q;
+      ++r;
+      ++i;
+      continue;
+    }
+    Edit e{r, r, {}};
+    while (i < ops.size() && ops[i] != '=') {
+      char op = ops[i++];
+      if (op != 'D')
+        e.alt += a.bases().at(q++);
+      if (op != 'I')
+        ++r;
+    }
+    e.end = r;
+    auto canonical = normalize(e, ref);
+    // Merge only when normalization reaches/crosses an earlier raw event, not
+    // merely because two independent variants are nearby. Include the original
+    // intervening matches, retaining the read's actual haplotype and order.
+    // Recheck the stack: normalization of a compound can reach another event.
+    while (!linked.empty() && canonical.begin <= linked.back().raw.end) {
+      auto previous = std::move(linked.back().raw);
+      linked.pop_back();
+      previous.alt.append(ref, previous.end, e.begin - previous.end);
+      previous.alt += e.alt;
+      previous.end = e.end;
+      e = std::move(previous);
+      canonical = normalize(e, ref);
+    }
+    linked.push_back({std::move(e), std::move(canonical)});
+  }
+  if (q + a.clip_right != a.bases().size() || r != a.end)
+    throw std::runtime_error("Invalid alignment trace");
+  std::vector<Edit> out;
+  out.reserve(linked.size());
+  for (auto &group : linked)
+    if (group.normalized.begin != group.normalized.end || !group.normalized.alt.empty())
+      out.push_back(std::move(group.normalized));
+  return out;
+}
 std::vector<Accepted> polish(const std::string &ref, const std::vector<Alignment> &alns, size_t nt,
-                             uint32_t support, double fraction, size_t max_indel) {
+                             uint32_t support, double fraction, size_t max_indel,
+                             bool linked_events) {
   std::vector<const Alignment *> ptrs;
   for (auto &a : alns)
     ptrs.push_back(&a);
-  return polish(ref, ptrs, nt, support, fraction, max_indel);
+  return polish(ref, ptrs, nt, support, fraction, max_indel, linked_events);
 }
 std::vector<Accepted> polish(const std::string &ref, const std::vector<const Alignment *> &alns,
-                             size_t nt, uint32_t support, double fraction, size_t max_indel) {
+                             size_t nt, uint32_t support, double fraction, size_t max_indel,
+                             bool linked_events) {
   // Filter before inserting into tree/set storage. Homopolymer noise must not
   // inflate the chromosome-wide candidate collection only to be discarded later.
   std::map<Edit, std::set<size_t>> candidates;
@@ -108,7 +198,7 @@ std::vector<Accepted> polish(const std::string &ref, const std::vector<const Ali
            encode(ref.substr(e.begin - 1, 1) + e.alt + ref.substr(e.end, 1)).bases;
   };
   for (size_t i = 0; i < alns.size(); ++i)
-    for (const auto &e : events(*alns[i], ref))
+    for (const auto &e : events(*alns[i], ref, linked_events))
       if (eligible(e))
         candidates[e].insert(i);
   // Interval endpoint indexes give the exact same spanning depth without scanning all reads per

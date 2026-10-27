@@ -71,7 +71,13 @@ public:
   uint32_t estimate(char base, const Histogram &observations, uint32_t fallback) const;
   uint32_t estimate_single(char base, uint32_t observed, uint32_t depth) const;
 
+  // Target local re-estimation when the top model likelihoods differ by less
+  // than log(100), or an unmodeled modal allele has less than 90% support.
+  bool uncertain(char base, const Histogram &observations) const;
+
 private:
+  std::vector<double> likelihood_scores(char base, const Histogram &observations,
+                                        bool require_eligible = true) const;
   size_t observed_max = 0;
   uint32_t minimum_depth = 5;
   std::map<char, std::vector<std::vector<double>>> log_probabilities;
@@ -124,18 +130,22 @@ EndExtension extend_ends(std::string &reference, const std::vector<EndRead> &rea
 // and soft-clip excluded query bases. Insertion at begin belongs to the crop;
 // insertion at end does not. Returns false if no query/reference overlap remains.
 bool crop_alignment(Alignment &a, size_t begin, size_t end);
-std::vector<Edit> events(const Alignment &a, const std::string &reference);
+// Normalize linked read-local differences together; false restores independent events.
+std::vector<Edit> events(const Alignment &a, const std::string &reference,
+                         bool linked_events = true);
 struct Accepted {
   Edit edit;
   int tier;
   uint32_t depth, support;
 };
 std::vector<Accepted> polish(const std::string &ref, const std::vector<Alignment> &alns,
-                             size_t tiers, uint32_t support, double fraction, size_t max_indel);
+                             size_t tiers, uint32_t support, double fraction, size_t max_indel,
+                             bool linked_events = true);
 // Borrowed alignments must remain alive for this call. Callers prefilter consensus
 // eligibility; returned edits are ordered, non-overlapping, and in draft space.
 std::vector<Accepted> polish(const std::string &ref, const std::vector<const Alignment *> &alns,
-                             size_t tiers, uint32_t support, double fraction, size_t max_indel);
+                             size_t tiers, uint32_t support, double fraction, size_t max_indel,
+                             bool linked_events = true);
 std::string apply(const std::string &ref, const std::vector<Accepted> &edits);
 // Map a draft boundary through sorted edits. Points inside a replacement map to
 // its start; a point at an insertion maps after inserted bases. Touching reads

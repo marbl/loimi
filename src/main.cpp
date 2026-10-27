@@ -2,6 +2,8 @@
 // Pipeline: package prepass -> per-tig offset -> batched HPC votes -> expansion
 // -> optional raw alignment/polish -> optional final-reference CRAM export.
 #include "core.hpp"
+#include "hp_refinement.hpp"
+#include "hp_flanks.hpp"
 #include "offsets.hpp"
 #include "options.hpp"
 #include "io.hpp"
@@ -421,6 +423,8 @@ int main(int argc, char **argv) {
     }
     std::vector<std::string> suffixes = {".fasta", ".run-calls.tsv", ".read-decisions.tsv",
                                          ".summary.json", ".template-offsets.tsv"};
+    if (o.hp_realign)
+      suffixes.push_back(".hp-realignment.tsv");
     const bool extend = (o.polish || o.extend) && !o.no_extend;
     if (extend)
       suffixes.push_back(".end-extensions.tsv");
@@ -478,6 +482,8 @@ int main(int argc, char **argv) {
              "\top\tlength\tstatus\tquery_raw_begin\tquery_raw_end\n";
     outputs[".template-offsets.tsv"]
         << "tig\toffset\tattempted\tplaced\tvalidation_support\ttolerance\tmethod\n";
+    if (o.hp_realign)
+      outputs[".hp-realignment.tsv"] << "tig\tdraft_begin\tdraft_end\tbefore\tafter\ttier\tdepth\n";
     if (o.polish)
       outputs[".non-hpc-edits.vcf"]
           << "##fileformat=VCFv4.2\n##reference=uncompressed_draft\n##INFO=<ID=TIER,Number=1,Type="
@@ -827,6 +833,7 @@ int main(int argc, char **argv) {
       // Release each tier's records after its ambiguous phase has completed.
       std::vector<std::map<size_t, Histogram>> uncertain(o.consistent_ambiguous ? nt : 0);
       const RunModel unmodeled;
+      std::set<size_t> realign_runs; // Sparse targets, indexed in HPC space.
       size_t active_tier = 0;
       std::vector<Call> selected(ref.size());
       // Bits: 1 threshold-qualified/final, 2 model changed length, 4 pooled,
@@ -915,6 +922,12 @@ int main(int argc, char **argv) {
                                : std::vector<uint8_t>{};
               size_t q = 0, r = w.hbegin, operation = 0;
               bool filtered_read = false;
+              // Usable overhang clipped by the template supplies flank distance;
+              // original package trimming must never count as usable context.
+              size_t left_context = w.hbegin == 0 ? w.a.clip_left - w.original_clip_left : 0;
+              size_t right_context = w.hend == ref.size() && ref.size() == complete_template_size
+                                         ? w.a.clip_right - w.original_clip_right
+                                         : 0;
               for (char op : w.trace) {
                 // Original raw clipping may cut a run. Do not vote with a truncated length.
                 bool partial = (q == 0 && w.a.clip_left > 0 &&
@@ -923,6 +936,12 @@ int main(int argc, char **argv) {
                                 w.a.bases()[w.a.bases().size() - w.a.clip_right - 1] ==
                                     w.a.bases()[w.a.bases().size() - w.a.clip_right]);
                 bool unflanked = o.terminal_hp_filter;
+                if (o.hp_flank_bases && op == '=')
+                  unflanked |= !has_span_flanks(
+                      w.rle.offsets.at(q), w.rle.offsets.at(q + 1), w.rle.offsets.back(),
+                      o.hp_flank_bases, operation > 0 && w.trace[operation - 1] == '=',
+                      operation + 1 < w.trace.size() && w.trace[operation + 1] == '=', r == 0,
+                      r + 1 == ref.size(), left_context, right_context);
                 // Stream only requested sites, retaining no per-read trace table.
                 // A row reports evidence eligibility, not whether this tier won.
                 if (o.evidence_read_votes && op != 'I' && r < evidence_mask.size() &&
@@ -1063,6 +1082,14 @@ int main(int argc, char **argv) {
                       ? model->second.estimate_single(ref[run], bin.length, bin.count)
                       : model->second.estimate(ref[run], it->second, candidate.length);
             selected[run] = candidate;
+            if (o.hp_realign) {
+              Histogram h = it == overflow.end() ? Histogram{{bin.length, bin.count}} : it->second;
+              const auto &calibration = model == models.end() ? unmodeled : model->second;
+              realign_runs.erase(run);
+              if (qualified &&
+                  (candidate.length != uncalibrated || calibration.uncertain(ref[run], h)))
+                realign_runs.insert(run);
+            }
             selected_flags[run] = (qualified ? 1 : 0) | (candidate.length != uncalibrated ? 2 : 0) |
                                   (vote_classes[run] == 3 ? 4 : 0) | (additive ? 8 : 0);
           }
@@ -1091,6 +1118,7 @@ int main(int argc, char **argv) {
       std::vector<uint8_t>().swap(evidence_mask);
       std::vector<size_t> prefix(ref.size() + 1);
       std::string draft;
+      std::vector<HpSite> realign_sites;
       // prefix is the exact HPC-run -> draft-base coordinate transform; the
       // sentinel supports reads ending at the final template run boundary.
       for (size_t i = 0; i < ref.size(); ++i) {
@@ -1105,6 +1133,8 @@ int main(int argc, char **argv) {
         prefix[i] = draft.size();
         draft.append(c.length, ref[i]);
         prefix[i + 1] = draft.size();
+        if (realign_runs.count(i))
+          realign_sites.push_back({prefix[i], prefix[i + 1], ref[i]});
         calls << name << '\t' << i << '\t' << prefix[i] << '\t' << prefix[i + 1] << '\t' << ref[i]
               << '\t' << c.length << '\t'
               << (c.tier < 0 ? "NO_EVIDENCE" : o.tiers[c.tier % o.tiers.size()].label) << '\t'
@@ -1118,6 +1148,7 @@ int main(int argc, char **argv) {
               << '\n';
       }
       std::vector<Call>().swap(selected);
+      realign_runs.clear();
       std::vector<uint8_t>().swap(selected_flags);
       memory_stage("draft called");
       size_t crop_begin = 0, crop_end = draft.size();
@@ -1213,6 +1244,11 @@ int main(int argc, char **argv) {
             draft, terminal, o.tiers.size(), models, o.end_support, o.max_end_extension,
             o.max_error, o.ambiguous_fallback, o.extend_left && crop_begin == 0,
             o.extend_right && crop_end == before && ref.size() == complete_template_size);
+        // Sites were recorded before extension, in raw draft coordinates.
+        for (auto &site : realign_sites) {
+          site.begin += added.left;
+          site.end += added.left;
+        }
         left_added += added.left;
         right_added += added.right;
         outputs[".end-extensions.tsv"] << name << '\t' << before << '\t' << added.left << '\t'
@@ -1231,6 +1267,7 @@ int main(int argc, char **argv) {
                   << added.right_candidates << ")\n";
       }
       std::vector<Accepted> edits;
+      size_t hp_edit_count = 0;
       if (o.polish) {
         write_fasta(outputs[".draft.fasta"], name,
                     std::string_view(draft).substr(crop_begin, crop_end - crop_begin));
@@ -1243,9 +1280,36 @@ int main(int argc, char **argv) {
               w.a.tier += o.tiers.size();
             alns.push_back(&w.a);
           }
-        edits =
-            polish(draft, alns, o.tiers.size() * (o.ambiguous_fallback ? 2 : 1), o.polish_support,
-                   o.polish_fraction, o.max_indel);
+        edits = polish(draft, alns, o.tiers.size() * (o.ambiguous_fallback ? 2 : 1),
+                       o.polish_support, o.polish_fraction, o.max_indel, o.linked_events);
+        if (o.hp_realign) {
+          auto hp_edits =
+              realign_homopolymers(draft, alns, realign_sites, o.tiers.size(), o.min_support,
+                                   models, o.ambiguous_fallback, o.max_indel, o.hp_flank_bases);
+          // Non-HPC edits retain priority. Never apply overlapping independent
+          // alleles or let a crop split a replacement; all coordinates are draft.
+          std::vector<Accepted> accepted_hp;
+          for (const auto &e : hp_edits) {
+            if (o.region && (e.edit.begin <= crop_begin || e.edit.end >= crop_end))
+              continue;
+            auto next =
+                std::lower_bound(edits.begin(), edits.end(), e.edit.begin,
+                                 [](const Accepted &x, size_t p) { return x.edit.end < p; });
+            if (next != edits.end() && next->edit.begin <= e.edit.end)
+              continue;
+            accepted_hp.push_back(e);
+            outputs[".hp-realignment.tsv"]
+                << name << '\t' << e.edit.begin << '\t' << e.edit.end << '\t'
+                << e.edit.end - e.edit.begin << '\t' << e.edit.alt.size() << '\t'
+                << o.tiers[e.tier % o.tiers.size()].label << '\t' << e.depth << '\n';
+          }
+          edits.insert(edits.end(), accepted_hp.begin(), accepted_hp.end());
+          hp_edit_count = accepted_hp.size();
+          std::sort(edits.begin(), edits.end(),
+                    [](const Accepted &a, const Accepted &b) { return a.edit < b.edit; });
+          std::cerr << "HP local realignment: " << realign_sites.size() << " targets, "
+                    << accepted_hp.size() << " edits\n";
+        }
         for (auto &w : work)
           if (w.a.tier >= int(o.tiers.size()))
             w.a.tier -= o.tiers.size();
@@ -1258,7 +1322,7 @@ int main(int argc, char **argv) {
                                        return e.edit.begin <= crop_begin || e.edit.end >= crop_end;
                                      }),
                       edits.end());
-        n_edits += edits.size();
+        n_edits += edits.size() - hp_edit_count;
         memory_stage("polishing complete");
         for (const auto &e : edits) {
           // VCF anchor indels with the preceding reference base, in draft coordinates.

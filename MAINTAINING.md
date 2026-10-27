@@ -15,6 +15,8 @@ changing that policy.
 | `src/models.cpp` | Calibration file validation and likelihood estimator |
 | `src/offsets.hpp`, `src/offsets.cpp` | HPC origin anchors, repeat-aware independent-read clustering and overlap validation |
 | `src/polish.cpp` | Raw-base candidate normalization, voting, edits and alignment tags |
+| `src/hp_flanks.hpp` | Raw query flank eligibility, including usable template-boundary overhangs |
+| `src/hp_refinement.hpp`, `src/hp_refinement.cpp` | Sparse uncertain-run local realignment and rebuilt tier evidence |
 | `src/ends.cpp` | Coverage-supported extension at biological template ends |
 | `src/parallel.hpp` | Bounded worker scheduling and joined exception propagation |
 | `src/main.cpp` | Native package ownership and pipeline stage orchestration |
@@ -47,6 +49,17 @@ storage lifetimes and original placement order, not just its final sequence.
 
 ## Development loop
 
+`make` builds the executable; `make test` runs six C++ and five Python test
+suites. Supply `VERKKO_ROOT` outside the expected submodule layout.
+Use a fresh `BUILD_DIR` after changing compiler or build flags. Keep the
+Makefile source/test lists in sync when adding modules.
+
+Promoted defaults are 500 raw bases of query flank and, during polishing,
+HP realignment plus linked-event normalization. The disable switches are
+`--no-hp-flank-filter`, `--no-hp-realign`, and `--no-linked-events`.
+Extension remains enabled during polishing, with `--no-extend-ends` to disable.
+Expansion-only runs must never silently acquire raw alignment work.
+
 Performance port validation (2026-10-22): the 230441637 fixture with four threads,
 polishing, and CRAM took 19.91 s before and 13.37 s after; OS peak RSS was
 278.4/284.9 MiB. All text artifacts and decoded SAM records matched. Other runs
@@ -73,7 +86,7 @@ parallel CRAM records across batch sizes.
 2. Add a small deterministic regression for the affected contract. Prefer
    comparing optimized code with a simple reference algorithm over timing tests.
 3. Format touched C++ with `.clang-format`, build, and run
-   `ctest --test-dir build --output-on-failure`. C++ checks throw even in Release.
+   `make test`. C++ checks throw even in Release.
 4. Use `tests/compare_versions.py` on a representative native fixture, with
    polishing and CRAM when relevant. The script requires a fresh work directory,
    preserves logs, compares text artifacts and decoded SAM records byte-for-byte,
@@ -83,19 +96,24 @@ parallel CRAM records across batch sizes.
    independent truth. Matching a baseline executable only proves equivalence,
    not that either sequence is biologically correct.
 
-For memory/undefined-behavior checks, configure a separate build with
-`-DHPC_ENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug`, retaining the same
-`VERKKO_ROOT` and compiler configuration. Run CTest there as well. This
-instruments this project's code, not the already-built Verkko archive. A
-production-only build can set `-DBUILD_TESTING=OFF` to omit test binaries and the
-Python requirement.
+For memory/undefined-behavior checks, use a separate Make build directory,
+retaining the same `VERKKO_ROOT` and compatible `CXX`:
+
+```sh
+make -j4 test BUILD_DIR=build-sanitize \
+  CXXFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+  LDFLAGS='-fsanitize=address,undefined'
+```
+
+This instruments this project's code, not the already-built Verkko archive.
+Plain `make` omits test binaries and does not require Python.
 
 Example (common input/tier flags follow the final `--`):
 
 ```sh
 python3 tests/compare_versions.py \
-  --before build/hpc-consensus-before-maintenance \
-  --after build/hpc-consensus --work /path/to/new-comparison --cram -- \
+  --before build/bin/hpc-consensus-before-maintenance \
+  --after build/bin/hpc-consensus --work /path/to/new-comparison --cram -- \
   --import fixture.cnspack --template-hpc fixture.fasta \
   --tier 'LA=hifi_m*' --tier-model LA=models/revio.run-model.tsv \
   --tier 'LAO=hifi_[0-9a-ln-z]*' --tier 'UL=ont_*' \

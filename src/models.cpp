@@ -91,7 +91,8 @@ uint32_t RunModel::estimate(char base, const Histogram &observations, uint32_t f
     double score = 0;
     for (auto [observed, count] : observations)
       score += count * found->second[length][std::min<size_t>(observed, observed_max)];
-    // Rows are ascending: exact score ties deterministically favor shorter runs.
+    // Rows are ascending: exact score ties deterministically favor shorter
+    // runs.
     if (score > best) {
       best = score;
       result = length + 1;
@@ -100,4 +101,30 @@ uint32_t RunModel::estimate(char base, const Histogram &observations, uint32_t f
   return result;
 }
 
+std::vector<double> RunModel::likelihood_scores(char base, const Histogram &h,
+                                                bool require_eligible) const {
+  auto found = log_probabilities.find(base);
+  auto mode = call({h}, 1);
+  if (found == log_probabilities.end() ||
+      (require_eligible && (mode.depth < minimum_depth || mode.length > found->second.size())))
+    return {};
+  std::vector<double> scores(found->second.size());
+  for (size_t i = 0; i < scores.size(); ++i)
+    for (auto [length, count] : h)
+      scores[i] += count * found->second[i][std::min<size_t>(length, observed_max)];
+  return scores;
+}
+bool RunModel::uncertain(char base, const Histogram &h) const {
+  if (h.empty())
+    return false;
+  auto scores = likelihood_scores(base, h);
+  if (scores.empty()) {
+    auto mode = call({h}, 1);
+    return double(mode.peak) / mode.depth < .9;
+  }
+  if (scores.size() < 2)
+    return false;
+  std::partial_sort(scores.begin(), scores.begin() + 2, scores.end(), std::greater<double>());
+  return scores[0] - scores[1] < std::log(100.0);
+}
 } // namespace hpc

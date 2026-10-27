@@ -13,7 +13,7 @@ Repository engineering expectations are in [AGENTS.md](AGENTS.md). C++ formattin
 and the module map, invariants and regression workflow are described in
 [MAINTAINING.md](MAINTAINING.md). Formatting
 is defined by `.clang-format`; use `clang-format -i src/*.cpp src/*.hpp tests/core.cpp`
-after code edits, then rebuild and run CTest as described below. Comments should
+after code edits, then rebuild and run `make test` as described below. Comments should
 explain invariants, ownership, coordinate conventions, and non-obvious decisions,
 not simply narrate statements.
 
@@ -21,33 +21,85 @@ Standalone C++ prototype for expanding a fixed homopolymer-compressed (HPC)
 template using reads and placements from Verkko `.cnspack` files. It reuses the
 native Canu/Verkko package reader; it does not use POA or remap reads genome-wide.
 
-Status: experimental prototype, October 8, 2026. Synthetic native-package tests
-pass, but a user-reported human chromosome benchmark showed substantially worse
-Merqury QV than mature Verkko consensus (40.98 versus 69.6). This is not a
-production-accuracy replacement. The existing Verkko pipeline is not modified.
+Status: prototype. Recent user-reported human chromosome runs reached about
+Merqury Q66 with HP realignment and 500-bp flank filtering, versus Q62.7 without
+those options. These are results from the experimental checkout, not a new
+full-chromosome benchmark of this port. Accuracy remains dataset-dependent.
+The existing Verkko pipeline is not modified.
 
-## Build
+## Default calling workflow
 
-Requires a C++20 compiler, CMake 3.18+, pkg-config, Python 3 (test configuration),
-and a built Verkko checkout containing `build/lib/libverkko.a`. Link dependencies
-are OpenSSL, libcurl, liblzma, zlib, bzip2, threads, and the OpenMP runtime used by
-the Verkko build. Use a compatible compiler, architecture, and store ABI.
-`samtools` on PATH is required only for CRAM export and its integration tests.
+Expansion-only runs use the 500-bp HP flank filter, then write the expanded
+template without raw realignment. Add `--polish-non-hpc` to enable linked-event
+polishing, HP realignment, and coverage-supported extension at both ends.
+CRAM export remains optional via `--cram FILE`.
 
-From this directory:
+The promoted features no longer need experimental flags:
+
+| Feature | Default | Disable |
+| --- | --- | --- |
+| HP query flank filter | 500 raw bases on each side | `--no-hp-flank-filter` |
+| HP local realignment | on during polishing | `--no-hp-realign` |
+| Linked-event polishing | on during polishing | `--no-linked-events` |
+| End extension | on during polishing | `--no-extend-ends` |
+
+Use `--hp-flank-bases N` to change the flank distance. `--hp-realign` and
+`--linked-events` explicitly enable their defaults; the last occurrence of
+these enable/disable controls wins. The old `--experiment-hp-realign` and
+`--experiment-hp-flank-bases` spellings remain compatibility aliases but are
+not needed in new commands. Unrelated experiments remain off. No corroboration
+model is used; optional ordinary tier models still apply.
+
+## Build with Make
+
+Requires a C++20 compiler with OpenMP, GNU Make, pkg-config, OpenSSL, libcurl,
+liblzma, zlib and bzip2 development libraries. Build Verkko first: this tool
+links its native `libverkko.a` and must use a compatible compiler/store ABI.
+Python 3 is required for tests; samtools enables CRAM tests and export.
+
+When installed as `verkko/src/hpc-consensus`, the Makefile finds headers in
+`../canu/src` and the library in `../../build/lib/libverkko.a` automatically:
 
 ```sh
-cmake -S . -B build \
-  -DVERKKO_ROOT=full/path/to/verkko \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j 4
-ctest --test-dir build --output-on-failure
-build/hpc-consensus --help
+make -j 4
+make test
+# Optional: copy into Verkko's build/bin:
+make install
 ```
 
-The executable is `build/hpc-consensus`. It is standalone at execution time
-apart from its dynamically linked system libraries and, for CRAM, `samtools`.
-Building still requires Verkko headers and its static library.
+The standalone executable is `build/bin/hpc-consensus`; objects are in `build/obj`.
+For a separate checkout, supply the Verkko repository root:
+
+```sh
+make -j 4 VERKKO_ROOT=/path/to/verkko
+make test VERKKO_ROOT=/path/to/verkko
+```
+
+`CXX`, `CPPFLAGS`, `CXXFLAGS`, `LDFLAGS`, `LDLIBS`, `PKG_CONFIG`, and
+`PYTHON` can be overridden. Compiler selection is left to Make and the caller;
+there is no compiler discovery. Set `CXX` in the environment or on the command
+line when needed, using a C++20 compiler with OpenMP compatible with Verkko.
+`OPENMP_FLAGS` and `OPENMP_LIBS` default to `-fopenmp` for compile and link.
+Set `VERKKO_BUILD` for a custom parent build directory, `VERKKO_LIB` for an
+explicit archive, and `BINDIR` for installation. Use a fresh `BUILD_DIR` or
+`make clean` when changing compiler or flags.
+
+### Parent Verkko integration
+
+The parent build should depend on its completed `libverkko.a`, then invoke
+the submodule. An example recipe, to adapt in Verkko's makefiles:
+
+```make
+# Dependency: $(TARGET_DIR)/lib/libverkko.a
+$(MAKE) -C hpc-consensus CXX="$(CXX)" \
+  VERKKO_BUILD="$(abspath $(TARGET_DIR))" DESTDIR= install
+```
+
+The submodule never invokes the parent build, fetches dependencies, or edits
+Verkko. This avoids recursive build cycles. `make install` copies only the
+executable; models are optional external files and are not installed implicitly.
+`DESTDIR` stages installation under `BINDIR`; the parent should pass its
+actual build path with `VERKKO_BUILD`, not reuse its staging variable as a root.
 
 ## Inputs
 
@@ -83,7 +135,7 @@ exchange format. Use packages compatible with the linked Verkko build.
 Fast uncompression, with illustrative name patterns (replace them for your data):
 
 ```sh
-build/hpc-consensus \
+build/bin/hpc-consensus \
   --import part.cnspack \
   --template-hpc paths.hpc.fasta \
   --tier 'hifi=hifi_*' --tier 'ont=ont_*' \
@@ -146,6 +198,18 @@ Separate regions of the same tig have the same name: keep their outputs separate
 
 ## Calling rules
 
+### Offset alignment in HPC space
+
+Layout coordinates and template coordinates may have different origins.
+Each aligned read estimates their translation in compressed runs; this is not
+a raw-base offset or a global parameter shared across tigs.
+For a whole-read anchor, `offset = layout_begin - aligned_template_begin`.
+The caller then maps a layout coordinate with `template_position =
+layout_position - offset`. Internal anchors account for their position within
+the read before estimating the same translation.
+
+#### Whole-read discovery and validation
+
 Template offsets are inferred independently for each tig. The tool tries up to
 32 uniquely placed, eligible reads, ordered by tier and then proximity to the
 layout start, preferring reads away from possible overhangs. Full compressed
@@ -155,6 +219,9 @@ Each set must support a consistent offset cluster (at least three reads and
 75% of estimates within a 20-HPC-base span); the two estimates must agree
 within 20 bases. The combined cluster's lower median is used. This is a
 heuristic consistency check, not a calibrated confidence probability.
+
+#### Internal anchors and layout-overlap rescue
+
 If whole-read inference fails, the fallback tests five internal chunks per
 candidate read (up to 5,000 HPC bases each). Only chunks occurring exactly once
 in the template provide anchors. At least 75% of informative reads must agree
@@ -188,6 +255,8 @@ available tier. More than 128 candidate loci fails explicitly. Each candidate
 is scored using **global alignment of the layout-predicted query interval**;
 it cannot relocate to a different repeat copy inside an enclosing read.
 
+#### Resolving competing offset candidates
+
 Each molecule contributes in its highest tier with usable overlap scores.
 Repeated IDs and recognized `hifi_UUID` / `ont_UUID` corrected/raw pairs count
 once; other names use their packaged IDs, without guessing biological aliases.
@@ -215,10 +284,14 @@ These are heuristic consistency checks, not calibrated confidence probabilities;
 consensus tier voting and MAPQ are unchanged. Region mode rereads the
 package with the same bounded ID sample only if its initial anchors fail.
 Unresolved offsets are never guessed.
+
+#### Boundary reads and small tigs
+
 Unresolved tigs fail explicitly. Reads crossing the inferred template boundary
 are aligned semi-globally to their overlapping HPC template interval. Overhangs
 are clipped at aligned run boundaries and represented as soft clips in CRAM;
-they do not extend or invent template sequence. Left, right, and two-sided
+they do not extend the template during this initial alignment. Eligible
+soft-clipped overhangs can subsequently support end extension. Left, right, and two-sided
 overhangs are supported. Ambiguous best endpoints or excessive alignment error
 produce `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
 `OUTSIDE_TEMPLATE`. Existing raw clipping is retained. If it cuts through a run
@@ -244,6 +317,10 @@ oriented read and soft clips, with a perfect match to the emitted sequence.
 Polishing leaves singleton sequences unchanged. No offset is inferred (reported
 as `.`), and run-call coordinates describe the passthrough sequence.
 
+### HPC run-length calling
+
+#### Tier selection and evidence
+
 Placements with packaged placement count exactly one and no distinct alternative
 in the input package are unique. Run calling searches all unique tiers first,
 requiring at least five observations by default. If none qualifies, it searches
@@ -268,6 +345,8 @@ within and across tigs. Identical entries (ID, coordinates, strand, and clipping
 within a tig) are deduplicated. A package prepass counts distinct occurrences.
 Uniqueness is trusted from the layout, not independently inferred by mapping.
 
+#### Run-length estimator
+
 For each template run, only matching aligned read bases contribute a run length.
 The first qualifying tier in the search above wins; lower tiers cannot outvote
 it. `--min-run-support` is a preference threshold, not a hard evidence discard:
@@ -275,7 +354,7 @@ sparse fallback prevents covered runs becoming unsupported. Setting it to one
 restores preference for even one unique observation. The called length is the
 empirical histogram mode. Tied modes
 are resolved by minimum total absolute distance to observations, then smaller
-length. This is not a fitted or smoothed distribution model. Quality priority is
+length. Without a tier model this is an empirical vote, not a fitted predictor. Quality priority is
 entirely user-specified by tiers, not per-base quality scores.
 
 `--experiment-run-mean` instead rounds the empirical mean of the selected
@@ -287,10 +366,12 @@ peak refer to the selected histogram, including both classes when pooled.
 The `peak` column is still the histogram's
 modal count, including when the experimental mean is used.
 
+#### Regional fixtures
+
 For native regional fixtures, the build also includes `extract-regions`:
 
 ```sh
-build/extract-regions input.cnspack 109 3424 regions.tsv
+build/bin/extract-regions input.cnspack 109 3424 regions.tsv
 ```
 
 Each regions.tsv row is `output_prefix HPC_begin HPC_end` in original-template
@@ -305,12 +386,53 @@ Without eligible evidence a run gets length one and is reported as
 `NO_EVIDENCE`; `--missing-run error` instead stops the run. N runs do not collect
 run-length evidence. Fast-mode output preserves the input HPC base sequence.
 
+### Raw-base polishing and linked events
+
+Enable this stage with `--polish-non-hpc`. Reads are aligned to the expanded
+draft. By default, changes on the same read are grouped when left-normalizing
+one reaches an earlier event. The combined allele retains intervening matching
+bases; nearby unrelated variants are not automatically merged. This gives
+equivalent split and contiguous CIGAR representations a shared vote without
+assembling an allele from different reads. `--no-linked-events` restores
+independent normalization for comparison.
+
 Optional correction calls substitutions and short non-HPC events from raw traces.
 It selects the first tier with sufficient spanning depth and requires alternate
 support and fraction thresholds. If both strands span the event in that tier,
 both must support it. Terminal events, pure run-length changes, overlapping or
 adjacent accepted edits, and alternate alleles containing N are excluded.
 There is one correction pass, not iterative polishing.
+
+### Homopolymer flank filtering and local re-estimation
+
+The flank filter requires 500 raw query bases and an immediately adjacent
+matching HPC run on each side of an interior observation. It does not require
+500 perfectly matching bases. Usable overhang clipped only by a true template
+boundary counts toward the distance, so the filter preserves end-extension
+support; package trimming does not count. Template endpoints waive only the
+outward-facing requirement. Singleton passthrough remains unchanged.
+
+HP realignment runs by default during polishing. It rebuilds evidence for uncertain or
+model-adjusted runs using 64-base local alignment context and 12 exact terminal
+matches, then reapplies the configured tier models. Unique tiers must qualify
+independently before within-tier ambiguous fallback is considered. Rebuilt
+observations also obey the requested query flank distance. Targets lacking
+context, runs longer than 1,000 bases, and query windows longer than 4,096 bases
+are skipped. Ordinary polishing edits take priority over overlapping HP edits.
+
+Accepted HP edits are recorded in `.hp-realignment.tsv` in zero-based, half-open
+raw draft coordinates, including any left extension. The existing
+`.non-hpc-edits.vcf` includes all accepted edits for coordinate lifting, despite
+its historical name; the summary's `non_hpc_edits` count excludes HP edits.
+Final CRAM alignments, when requested, use the corrected final sequence.
+Polishing enables end extension unless `--no-extend-ends` is supplied.
+
+The implementation is isolated in `src/hp_refinement.*` and `src/hp_flanks.hpp`.
+It retains sparse candidate histograms and temporary per-read coordinate maps,
+not chromosome-length arrays for every read. Local realignment is currently
+serial and adds runtime proportional to read overlap with candidate sites.
+Tests cover model uncertainty, unique/ambiguous fallback, flank boundaries,
+actual post-draft edits, CRAM validity, and extension on both ends.
 
 ### Coverage-supported end recovery
 
@@ -367,7 +489,11 @@ avoid treating the fixture's artificial opposite edge as a biological end.
 | `--missing-run one\|error` | one | Policy when no tier qualifies |
 | `--unmatched error\|drop` | error | Policy for eligible reads matching no tier |
 | `--max-error F` | 0.15 | Unit edit-distance cap, rounded up, relative to the longer sequence |
-| `--polish-non-hpc` | off | Enable conservative correction |
+| `--polish-non-hpc` | off | Enable raw-base correction, HP refinement and end recovery |
+| `--hp-flank-bases N` | 500 | Raw query context required for HP observations |
+| `--no-hp-flank-filter` | off | Disable that flank requirement |
+| `--no-hp-realign` | off | Disable default HP refinement during polishing |
+| `--no-linked-events` | off | Disable default linked-event grouping |
 | `--min-polish-support N` | 5 | Minimum spanning depth and alternate count in the chosen tier |
 | `--min-polish-fraction F` | 0.9 | Alternate fraction; must exceed 0.5 |
 | `--max-polish-indel N` | 500 | Maximum reference or alternate event length, including complex events |
@@ -442,7 +568,21 @@ this README describes the implemented prototype.
 
 Attach a separate model to any named tier; tiers without a model keep the mode
 caller. Models do not alter tier order, unique-placement preference, eligibility,
-singleton pass-through, or the optional polishing/CRAM stages.
+or singleton pass-through. HP realignment reapplies the selected tier model to
+its rebuilt evidence; ordinary non-HPC polishing does not use this model.
+
+This is a **discrete conditional-probability model**, not linear regression,
+nonlinear regression, or a neural network. For each base and possible true run
+length, a table stores `P(observed_length | true_length, base, tier)`. Given a
+histogram with counts `n[o]`, the caller selects the true length `L` maximizing
+`sum_o n[o] * log P(o | L, base, tier)`: maximum-likelihood inference with no
+length prior. Reads are treated as independent observations for scoring.
+
+The supplied calibration script estimates these categorical probabilities from
+truth-labeled observations, normalizing each locus to equal weight. It smooths
+toward the A/T or C/G base-family distribution and adds a small uniform outlier
+component, so unseen observations do not have zero probability. The model file
+contains the final probability tables; no fitting occurs during consensus.
 
 ```bash
 --tier 'LA=hifi_m*' --tier 'LAO=hifi_[0-9a-ln-z]*' --tier 'UL=ont_*' \
@@ -453,7 +593,8 @@ singleton pass-through, or the optional polishing/CRAM stages.
 
 These are **dataset/chemistry-specific experimental models**, not universal
 technology defaults. Validate a model after changing the read-generation or
-correction pipeline. No pretrained model is bundled. Mode remains the fallback
+correction pipeline. The repository includes `models/revio.run-model.tsv`; it is used only when
+explicitly selected with `--tier-model`, not automatically. Mode remains the fallback
 below the model's minimum depth, for an unmodeled base, or when the original
 modal length is outside that base's calibrated range. Models cannot be combined
 with `--experiment-run-mean`. The summary reports `model_changed_runs`, and
@@ -525,7 +666,7 @@ strata, and LA-first/LAO-first priority simulations. These are sampled run
 errors, not full-sequence QV. Keep an additional independent dataset for final
 assessment when comparing or tuning models against these validation results.
 
-For predictor parity checks, `build/apply-run-model MODEL` reads stdin rows
+For predictor parity checks, `build/bin/apply-run-model MODEL` reads stdin rows
 `BASE LENGTH:COUNT [LENGTH:COUNT ...]` and prints the mode and calibrated call.
 This diagnostic uses the production C++ predictor without rerunning alignments.
 

@@ -9,7 +9,7 @@ changing that policy.
 | File | Responsibility |
 | --- | --- |
 | `src/options.hpp`, `src/options.cpp` | Configuration defaults, CLI parsing and validation |
-| `src/io.hpp`, `src/io.cpp` | FASTA, template-name map, literal-argument subprocess execution |
+| `src/io.hpp`, `src/io.cpp` | FASTA, literal-argument subprocess execution |
 | `src/core.hpp` | Algorithm interfaces, coordinate conventions and ownership contracts |
 | `src/core.cpp` | RLE, alignment adapters, local HPC filtering and empirical run estimator |
 | `src/models.cpp` | Calibration file validation and likelihood estimator |

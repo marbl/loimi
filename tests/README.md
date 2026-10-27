@@ -28,7 +28,7 @@ The older tiny `native-package` and `native-offset` fixtures explicitly disable
 HP flank filtering and refinement because they lack 500-bp query context.
 The dedicated HP/end fixtures exercise the production defaults instead.
 `maintenance` also verifies default CLI configuration, disable/re-enable
-controls, and the old HP option compatibility aliases.
+controls, and rejection of removed experimental options.
 
 `core` tests run encoding (including long homopolymers), reverse complement,
 name glob ordering, run-mode/tie selection, tier fallback/support, alignment
@@ -63,7 +63,7 @@ Please provide a directory (or paths) containing:
 
 1. The `.cnspack` file(s) to process, from the compatible Verkko build.
 2. The corresponding HPC path/template FASTA in the exact packaged layout
-   coordinate system. Use numeric tig IDs, or include the tig-name-to-ID map.
+   coordinate system. Use numeric tig IDs or matching `tig`/`piece`-prefixed IDs.
 3. The ordered read-name wildcard tiers, including how unmatched reads should
    be handled. Example names from each technology help verify the patterns.
 4. Optionally, the existing Verkko consensus for a direct baseline comparison.

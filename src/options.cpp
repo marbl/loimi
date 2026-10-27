@@ -67,18 +67,11 @@ Options parse_options(int argc, char **argv) {
              "  --tier 'hifi=hifi_*' --tier 'other=*' --output PREFIX [options]\n"
              "--template-hpc FILE   Required when package has no embedded HPC bases\n"
              "Template offsets are inferred per tig; singleton reads pass through directly.\n"
-             "--tig-map FILE        Template association: internal_ID FASTA_name per line\n"
              "Output names are tig + eight-digit packaged tig ID (e.g. tig00000109).\n"
              "--region TIG:BEGIN-END  One tig, zero-based half-open uncompressed draft bases\n"
              "--region-flank N      Context in bases/runs (default 100000; region mode only)\n"
-             "--experiment-run-mean  Diagnostic rounded-mean run caller (default: mode)\n"
-             "--experiment-consistent-ambiguous  Bounded same-tier ambiguous run evidence\n"
-             "--experiment-retain-higher-unique  Retain higher unique votes on unique-tier "
-             "fallback;\n"
-             "                        mixed run histograms use mode, not a single-tier model\n"
              "--evidence-sites FILE  Export all-tier HPC histograms at TIG RUN rows (zero-based)\n"
              "--evidence-read-votes  Also trace per-read evidence at --evidence-sites\n"
-             "--experiment-terminal-hp-filter  Exclude unflanked query-terminal HP votes\n"
              "--hp-flank-bases N    Require N raw query bases and adjacent HPC matches (default "
              "500) on "
              "each side\n"
@@ -114,8 +107,6 @@ Options parse_options(int argc, char **argv) {
       o.input = value();
     else if (a == "--template-hpc")
       o.templates = value();
-    else if (a == "--tig-map")
-      o.tig_map = value();
     else if (a == "--region")
       parse_region(o, value());
     else if (a == "--region-flank")
@@ -139,19 +130,11 @@ Options parse_options(int argc, char **argv) {
       o.extend_right = side != "left";
     } else if (a == "--polish-non-hpc")
       o.polish = true;
-    else if (a == "--experiment-run-mean")
-      o.experiment_mean = true;
-    else if (a == "--experiment-consistent-ambiguous")
-      o.consistent_ambiguous = true;
-    else if (a == "--experiment-retain-higher-unique")
-      o.retain_higher_unique = true;
     else if (a == "--evidence-sites")
       o.evidence_sites = value();
     else if (a == "--evidence-read-votes")
       o.evidence_read_votes = true;
-    else if (a == "--experiment-terminal-hp-filter")
-      o.terminal_hp_filter = true;
-    else if (a == "--hp-realign" || a == "--experiment-hp-realign")
+    else if (a == "--hp-realign")
       o.hp_realign = true;
     else if (a == "--no-hp-realign")
       o.hp_realign = false;
@@ -161,7 +144,7 @@ Options parse_options(int argc, char **argv) {
       o.linked_events = true;
     else if (a == "--no-hp-flank-filter")
       o.hp_flank_bases = 0;
-    else if (a == "--hp-flank-bases" || a == "--experiment-hp-flank-bases")
+    else if (a == "--hp-flank-bases")
       o.hp_flank_bases = parse_positive_integer(value());
     else if (a == "--evidence-exclude-reads")
       o.evidence_exclude_reads = value();
@@ -172,7 +155,7 @@ Options parse_options(int argc, char **argv) {
               "Expected --tier-model LABEL=FILE");
       require(o.model_paths.emplace(v.substr(0, equal), v.substr(equal + 1)).second,
               "Duplicate tier model");
-    } else if (a == "--ambiguous-fallback" || a == "--experiment-ambiguous-fallback")
+    } else if (a == "--ambiguous-fallback")
       o.ambiguous_fallback = true;
     else if (a == "--unique-only")
       o.ambiguous_fallback = false;
@@ -226,14 +209,6 @@ Options parse_options(int argc, char **argv) {
   // not an implicit request to align reads in fast runs.
   o.hp_realign = o.hp_realign && o.polish;
   require(o.polish_fraction > 0.5, "Polishing fraction must exceed 0.5");
-  require(o.model_paths.empty() || !o.experiment_mean,
-          "--tier-model cannot be combined with --experiment-run-mean");
-  require(!o.retain_higher_unique || !o.experiment_mean,
-          "Additive unique experiment uses mode, not --experiment-run-mean");
-  require(!o.consistent_ambiguous ||
-              (o.ambiguous_fallback && !o.retain_higher_unique && !o.experiment_mean),
-          "Consistent ambiguous experiment requires ambiguous reads and cannot combine estimator "
-          "experiments");
   for (const auto &[label, path] : o.model_paths)
     require(std::any_of(o.tiers.begin(), o.tiers.end(),
                         [&](const auto &tier) { return tier.label == label; }),

@@ -196,26 +196,22 @@ with tempfile.TemporaryDirectory(prefix="hpc-consensus-test-") as td:
     for i, region in enumerate(("tig00000001:9-2", "tig00000001:-1-3", "tig00000002:0-10",
                                 "tig00000001:100-200")):
         run(base + ["--region", region, "--output", root / f"bad-region-{i}"], ok=False)
-    # Template numbering need not match native package numbering. A conflicting
-    # numeric header must not override the explicitly mapped template name.
-    (root / "mapped.fa").write_text(">piece000111\nACGT\n>1\nTGCA\n")
-    (root / "tig.map").write_text("# internal ID, template name\n\n1 piece000111\n")
-    mapped = base + ["--template-hpc", root / "mapped.fa", "--tig-map", root / "tig.map"]
-    run(mapped + ["--output", root / "mapped"])
-    assert (root / "mapped.fasta").read_bytes() == (root / "fast.fasta").read_bytes()
-    # Accept the native Verkko table heading as well as headerless maps.
-    (root / "tig.map").write_text("     tigID  tig name\n----------  --------------------\n         1  piece000111\n         2  piece000002\n         3  piece000003\n")
-    run(mapped + ["--output", root / "mapped-header"])
-    assert (root / "mapped-header.fasta").read_bytes() == (root / "fast.fasta").read_bytes()
-    for label, contents in [("duplicate-id", "1 piece000111\n1 other\n"),
-                            ("duplicate-name", "1 piece000111\n2 piece000111\n"),
-                            ("invalid-id", "-1 piece000111\n"),
-                            ("extra-column", "1 piece000111 extra\n"),
-                            ("bad-header", "tigID wrong name\n1 piece000111\n"),
-                            ("bad-row-after-header", "tigID tig name\n---------- --------------------\nnot-an-id piece000111\n"),
-                            ("missing-entry", "2 piece000111\n")]:
-        (root / "bad.map").write_text(contents)
-        run(mapped + ["--tig-map", root / "bad.map", "--output", root / label], ok=False)
+    # Template IDs must match packaged IDs; standard spellings need no map.
+    for header in ("1", "tig00000001", "piece000001"):
+        template = root / (header + ".fa")
+        template.write_text(f">{header}\nACGT\n")
+        output = root / ("named-" + header)
+        run(base + ["--template-hpc", template, "--output", output])
+        assert output.with_suffix(".fasta").read_bytes() == (root / "fast.fasta").read_bytes()
+        region = root / ("named-region-" + header)
+        run(base + ["--template-hpc", template, "--region", "tig00000001:2-9",
+                    "--output", region])
+        assert sequence(region.with_suffix(".fasta")) == sequence(root / "fast.fasta")[2:9]
+    (root / "wrong-id.fa").write_text(">piece000111\nACGT\n")
+    run(base + ["--template-hpc", root / "wrong-id.fa", "--output", root / "wrong-id"], ok=False)
+    removed = run(base + ["--tig-map", root / "unused.map", "--output", root / "removed-map"],
+                  ok=False)
+    assert "Unknown option: --tig-map" in removed.stderr
     metrics = json.loads((root / "fast.summary.json").read_text())
     assert metrics["base_alignments"] == 0 and metrics["cram_records"] == 0
     assert metrics["dropped"] == 0

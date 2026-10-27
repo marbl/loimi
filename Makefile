@@ -7,7 +7,6 @@ VERKKO_SRC ?= $(VERKKO_ROOT)/src
 VERKKO_BUILD ?= $(VERKKO_ROOT)/build
 VERKKO_LIB ?= $(VERKKO_BUILD)/lib/libverkko.a
 BUILD_DIR ?= build
-BINDIR ?= $(VERKKO_BUILD)/bin
 PKG_CONFIG ?= pkg-config
 PYTHON ?= python3
 
@@ -17,12 +16,15 @@ ifneq ($(shell uname -s),Darwin)
 PLATFORM_LIBS := -ldl
 endif
 CXXFLAGS ?= -O3 -g
+# GCC 9 accepts the draft spelling, not -std=c++20. Newer GCC and Clang
+# accept c++2a too; leave compiler selection entirely with the caller.
+CXX_STANDARD ?= c++2a
 OPENMP_FLAGS ?= -fopenmp
 OPENMP_LIBS ?= $(OPENMP_FLAGS)
 DEP_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl libcurl liblzma 2>/dev/null)
 DEP_LIBS := $(shell $(PKG_CONFIG) --libs openssl libcurl liblzma 2>/dev/null)
 # Quote-only search avoids utility/math.H shadowing the system math.h on macOS.
-PROJECT_FLAGS = -std=c++20 -pthread $(OPENMP_FLAGS) -Isrc \
+PROJECT_FLAGS = -std=$(CXX_STANDARD) -pthread $(OPENMP_FLAGS) -Isrc \
   -iquote$(VERKKO_SRC)/canu/src/utility/src -iquote$(VERKKO_SRC)/canu/src/stores \
   $(DEP_CFLAGS)
 PROJECT_LIBS = $(VERKKO_LIB) $(DEP_LIBS) -lz -lbz2 -pthread $(OPENMP_LIBS) $(PLATFORM_LIBS)
@@ -33,7 +35,7 @@ TEST_NAMES := core offsets maintenance hp_refinement hp_flanks linked_events
 TEST_BINS := $(addprefix $(BUILD_DIR)/tests/,$(TEST_NAMES))
 HELPERS := $(BUILD_DIR)/bin/extract-regions $(BUILD_DIR)/bin/apply-run-model
 
-.PHONY: all check-deps test install clean
+.PHONY: all check-deps test clean
 all: $(PROGRAM)
 
 # Order-only prerequisite validates configuration without forcing recompilation.
@@ -73,11 +75,6 @@ test: $(PROGRAM) $(TEST_BINS) $(HELPERS)
 	$(PYTHON) tests/offset_native.py $(abspath $(PROGRAM)) $(VERKKO_ROOT)
 	$(PYTHON) tests/integration.py $(abspath $(PROGRAM)) $(VERKKO_ROOT)
 	$(PYTHON) tests/calibration.py
-
-# Let the parent build choose its staging location; never rebuild Verkko here.
-install: $(PROGRAM)
-	install -d "$(DESTDIR)$(BINDIR)"
-	install -m 755 $(PROGRAM) "$(DESTDIR)$(BINDIR)/hpc-consensus"
 
 clean:
 	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(BUILD_DIR)/obj/main.o $(BUILD_DIR)/obj/main.d $(PROGRAM) $(TEST_BINS) $(addsuffix .d,$(TEST_BINS)) $(HELPERS)

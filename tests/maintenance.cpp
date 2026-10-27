@@ -50,10 +50,11 @@ int main() {
   check(explicit_flags.hp_realign && explicit_flags.hp_flank_bases == 300 &&
             explicit_flags.linked_events,
         "Explicit enable switches and custom flank values override earlier disables");
-  auto aliases = options(
-      {"--polish-non-hpc", "--experiment-hp-realign", "--experiment-hp-flank-bases", "500"});
-  check(aliases.hp_realign && aliases.hp_flank_bases == 500,
-        "Old HP spellings remain compatibility aliases");
+  for (const auto &removed : {"--experiment-run-mean", "--experiment-consistent-ambiguous",
+                              "--experiment-retain-higher-unique",
+                              "--experiment-terminal-hp-filter", "--experiment-hp-realign",
+                              "--experiment-hp-flank-bases", "--experiment-ambiguous-fallback"})
+    rejects([&] { options({removed}); });
   std::vector<unsigned> visited(1000);
   parallel(visited.size(), 4, [&](size_t i) { ++visited[i]; });
   for (auto count : visited)

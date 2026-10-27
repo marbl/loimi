@@ -104,29 +104,21 @@ static unsigned placement_mapq(unsigned n) {
     return 60;
   return unsigned(std::lround(-10 * std::log10(1.0 - 1.0 / n)));
 }
-// Shared lookup for region planning and the full caller; the name map remains
-// authoritative even when the chosen region is only a prefix of a template.
-static std::string template_for(tgTig &tig, const Options &o,
-                                const std::map<std::string, std::string> &templates,
-                                const std::map<uint32_t, std::string> &names) {
+// Shared lookup for region planning and full calling. Template identifiers use
+// the packaged tig ID; output naming remains independent of the accepted prefix.
+static std::string template_for(tgTig &tig, const std::map<std::string, std::string> &templates) {
   std::string ref(tig.bases() ? tig.bases() : "", tig._basesLen);
   auto it = templates.end();
-  if (!o.tig_map.empty()) {
-    auto n = names.find(tig.tigID());
-    if (n != names.end())
-      it = templates.find(n->second);
-  } else {
-    for (const auto &prefix : {std::string("tig"), std::string(""), std::string("piece")}) {
-      std::ostringstream key;
-      key << prefix << std::setfill('0')
-          << std::setw(prefix == "tig"     ? 8
-                       : prefix == "piece" ? 6
-                                           : 0)
-          << tig.tigID();
-      it = templates.find(key.str());
-      if (it != templates.end())
-        break;
-    }
+  for (const auto &prefix : {std::string("tig"), std::string(""), std::string("piece")}) {
+    std::ostringstream key;
+    key << prefix << std::setfill('0')
+        << std::setw(prefix == "tig"     ? 8
+                     : prefix == "piece" ? 6
+                                         : 0)
+        << tig.tigID();
+    it = templates.find(key.str());
+    if (it != templates.end())
+      break;
   }
   if (it != templates.end()) {
     require(ref.empty() || ref == it->second, "Embedded/external template mismatch");
@@ -384,7 +376,6 @@ int main(int argc, char **argv) {
   try {
     Options o = parse_options(argc, argv);
     auto templates = fasta(o.templates);
-    auto mapped_names = template_names(o.tig_map);
     std::map<int, RunModel> models;
     for (size_t i = 0; i < o.tiers.size(); ++i) {
       auto path = o.model_paths.find(o.tiers[i].label);
@@ -430,8 +421,6 @@ int main(int argc, char **argv) {
       suffixes.push_back(".end-extensions.tsv");
     if (o.region)
       suffixes.push_back(".region.tsv");
-    if (o.consistent_ambiguous)
-      suffixes.push_back(".borrowing.tsv");
     if (!o.evidence_sites.empty())
       suffixes.push_back(".run-evidence.tsv");
     if (o.evidence_read_votes)
@@ -548,7 +537,7 @@ int main(int argc, char **argv) {
             return false;
           if (!prepared) {
             prepared = true;
-            template_seq = template_for(tig, o, templates, mapped_names);
+            template_seq = template_for(tig, templates);
             for (uint32_t i = 0; i < tig.numberOfChildren(); ++i) {
               auto p = tig.getChild(i);
               if (p->_numPlacement == 1 && occurrences[p->ident()] == 1 &&
@@ -660,7 +649,7 @@ int main(int argc, char **argv) {
       label << "tig" << std::setfill('0') << std::setw(8) << tig.tigID();
       std::string name = label.str();
       require(name.find_first_of("\t\r\n ") == std::string::npos, "Invalid contig name");
-      std::string ref = template_for(tig, o, templates, mapped_names);
+      std::string ref = template_for(tig, templates);
       const size_t complete_template_size = ref.size();
       if (o.region && tig.numberOfChildren() != 1)
         ref.resize(region_hpc_end);
@@ -772,7 +761,7 @@ int main(int argc, char **argv) {
       }
       require(!ref.empty(),
               "Tig " + name +
-                  " has no HPC template; check --template-hpc and --tig-map associations");
+                  " has no HPC template; check --template-hpc names match packaged tig IDs");
       for (size_t i = 0; i < ref.size(); ++i)
         if (std::string_view("ACGTN").find(ref[i]) == std::string_view::npos ||
             (i && ref[i] == ref[i - 1]))
@@ -829,20 +818,13 @@ int main(int argc, char **argv) {
         uint32_t length, count;
       };
       std::vector<std::vector<SparseVote>> pending(nt);
-      // Retain only uncertain qualified histograms, not dense all-tier evidence.
-      // Release each tier's records after its ambiguous phase has completed.
-      std::vector<std::map<size_t, Histogram>> uncertain(o.consistent_ambiguous ? nt : 0);
       const RunModel unmodeled;
       std::set<size_t> realign_runs; // Sparse targets, indexed in HPC space.
-      size_t active_tier = 0;
       std::vector<Call> selected(ref.size());
-      // Bits: 1 threshold-qualified/final, 2 model changed length, 4 pooled,
-      // 8 additive higher-tier unique evidence (experimental mode calling),
-      // 16 same-tier ambiguous borrowing changed the final length.
+      // Bits: 1 threshold-qualified/final, 2 model changed length, 4 pooled.
       std::vector<uint8_t> selected_flags(ref.size());
       auto add_vote = [&](size_t run, uint32_t length, uint32_t count, uint8_t kind) {
-        if ((selected_flags[run] & 1) &&
-            !(o.consistent_ambiguous && uncertain[active_tier].count(run)))
+        if (selected_flags[run] & 1)
           return;
         auto &bin = bins[run];
         vote_classes[run] |= kind;
@@ -867,7 +849,6 @@ int main(int argc, char **argv) {
       for (size_t phase = 0; phase < groups.size(); ++phase) {
         bool pooled_phase = phase >= nt;
         size_t tier = phase % nt;
-        active_tier = tier;
         if (pooled_phase && o.ambiguous_fallback) {
           for (const auto &vote : pending[tier])
             add_vote(vote.run, vote.length, vote.count, 1);
@@ -935,7 +916,7 @@ int main(int argc, char **argv) {
                                (q + 1 == w.rle.bases.size() && w.a.clip_right > 0 &&
                                 w.a.bases()[w.a.bases().size() - w.a.clip_right - 1] ==
                                     w.a.bases()[w.a.bases().size() - w.a.clip_right]);
-                bool unflanked = o.terminal_hp_filter;
+                bool unflanked = false;
                 if (o.hp_flank_bases && op == '=')
                   unflanked |= !has_span_flanks(
                       w.rle.offsets.at(q), w.rle.offsets.at(q + 1), w.rle.offsets.back(),
@@ -999,9 +980,6 @@ int main(int argc, char **argv) {
           }
           batch = end;
         }
-        // Sorted sparse histories let additive fallback retain higher-tier
-        // votes without another dense chromosome-sized histogram allocation.
-        std::vector<size_t> higher_cursors(tier);
         // A qualifying unique tier seals the call before any ambiguous tier
         // is considered. Otherwise retain its histogram for same-tier pooling.
         for (size_t run = 0; run < ref.size(); ++run) {
@@ -1012,30 +990,10 @@ int main(int argc, char **argv) {
           Call candidate{bin.length, bin.count, bin.count, int(tier)};
           if (it != overflow.end()) {
             it->second[bin.length] = bin.count;
-            candidate = call({it->second}, 1, o.experiment_mean);
-          }
-          if (o.consistent_ambiguous && pooled_phase && (selected_flags[run] & 1)) {
-            auto found = uncertain[tier].find(run);
-            require(found != uncertain[tier].end(), "Missing uncertain unique histogram");
-            Histogram a = it == overflow.end() ? Histogram{{bin.length, bin.count}} : it->second;
-            auto m = models.find(int(tier));
-            const auto &model = m == models.end() ? unmodeled : m->second;
-            auto before = selected[run].length;
-			/*
-            selected[run].length = model.borrow(ref[run], found->second, a, before);
-            if (selected[run].length != before)
-              selected_flags[run] |= 16;
-            outputs[".borrowing.tsv"] << name << '\t' << run << '\t' << ref[run] << '\t'
-                                      << o.tiers[tier].label << '\t' << selected[run].depth << '\t'
-                                      << candidate.depth << '\t' << before << '\t'
-                                      << selected[run].length << '\n';
-									  */
-            bin = {};
-            vote_classes[run] = 0;
-            continue;
+            candidate = call({it->second}, 1);
           }
           bool qualified = candidate.depth >= o.min_support;
-          if (!pooled_phase && !qualified && (o.ambiguous_fallback || o.retain_higher_unique)) {
+          if (!pooled_phase && !qualified && o.ambiguous_fallback) {
             pending[tier].push_back({run, bin.length, bin.count});
             if (it != overflow.end())
               for (auto [length, count] : it->second)
@@ -1044,39 +1002,12 @@ int main(int argc, char **argv) {
           }
           if ((pooled_phase || qualified || !o.ambiguous_fallback) &&
               (qualified || selected[run].tier < 0)) {
-            bool additive = false;
-            Histogram mixed;
-            if (o.retain_higher_unique && !pooled_phase && qualified) {
-              // Qualification uses this tier alone, never accumulated depth.
-              // All earlier unique tiers failed that threshold at this run.
-              for (size_t higher = 0; higher < tier; ++higher) {
-                auto &cursor = higher_cursors[higher];
-                const auto &history = pending[higher];
-                while (cursor < history.size() && history[cursor].run < run)
-                  ++cursor;
-                while (cursor < history.size() && history[cursor].run == run) {
-                  const auto &v = history[cursor++];
-                  mixed[v.length] += v.count;
-                  additive = true;
-                }
-              }
-              if (additive) {
-                if (it == overflow.end())
-                  mixed[bin.length] += bin.count;
-                else
-                  for (auto [length, count] : it->second)
-                    mixed[length] += count;
-                candidate = call({mixed}, 1);
-              }
-            }
             // Sparse calls are tentative: a later qualifying tier overrides
             // them, but another sparse tier cannot displace the first one.
             candidate.tier = int(tier + ((vote_classes[run] & 2) ? nt : 0));
             uint32_t uncalibrated = candidate.length;
             auto model = models.find(int(tier));
-            // A single technology's likelihood is invalid for mixed evidence.
-            // This experiment deliberately uses raw mode at mixed sites only.
-            if (model != models.end() && !additive)
+            if (model != models.end())
               candidate.length =
                   it == overflow.end()
                       ? model->second.estimate_single(ref[run], bin.length, bin.count)
@@ -1091,14 +1022,12 @@ int main(int argc, char **argv) {
                 realign_runs.insert(run);
             }
             selected_flags[run] = (qualified ? 1 : 0) | (candidate.length != uncalibrated ? 2 : 0) |
-                                  (vote_classes[run] == 3 ? 4 : 0) | (additive ? 8 : 0);
+                                  (vote_classes[run] == 3 ? 4 : 0);
           }
           bin = {};
           vote_classes[run] = 0;
         }
         overflow.clear();
-        if (o.consistent_ambiguous && pooled_phase)
-          uncertain[tier].clear();
       }
       // Release accumulation storage before allocating raw-coordinate prefixes.
       std::vector<RunBin>().swap(bins);
@@ -1140,8 +1069,6 @@ int main(int argc, char **argv) {
               << (c.tier < 0 ? "NO_EVIDENCE" : o.tiers[c.tier % o.tiers.size()].label) << '\t'
               << c.depth << '\t' << c.peak << '\t'
               << (c.tier < 0                 ? "NONE"
-                  : (selected_flags[i] & 16) ? "UNIQUE_BORROWED"
-                  : (selected_flags[i] & 8)  ? "UNIQUE_ADDITIVE"
                   : (selected_flags[i] & 4)  ? "POOLED"
                   : ambiguous_call           ? "AMBIGUOUS"
                                              : "UNIQUE")

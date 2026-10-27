@@ -49,8 +49,8 @@ behavior. Proposed options and guarantees below are not automatically supported.
 - C++20, native Verkko package readers, and unit-cost edlib alignment are
   implemented. Affine-gap ksw2/WFA backends and direct reuse of packaged CIGARs
   remain proposals, not implemented paths.
-- `--tig-map` maps `internal_ID FASTA_name` rows to template sequences; without
-  it, numeric IDs, `tig00000001`, and legacy `piece000001` names are accepted.
+- Template FASTA names encode the packaged tig ID directly: numeric IDs,
+  `tig00000001`, and legacy `piece000001` names are accepted. No name map is used.
   Outputs always use `tig` plus the internal ID zero-padded to eight digits.
   Automatic scfmap/GFA-path association and modified package writers are pending.
 - Offsets are inferred independently per tig. A single eligible unique read
@@ -220,7 +220,7 @@ For backward compatibility with already-created packages whose tig bases are emp
 --template-hpc assembly.hpc.fasta
 ```
 
-The template records are keyed to package tig IDs (or resolved through the existing `tigName_to_ID.map`). If both embedded and external templates exist, require exact agreement. Validate that adjacent symbols differ, apart from the documented `N` policy, and that template length equals the packaged HPC layout length.
+The template records are keyed directly to package tig IDs using numeric, `tig`-prefixed, or `piece`-prefixed names. If both embedded and external templates exist, require exact agreement. Validate that adjacent symbols differ, apart from the documented `N` policy, and that template length equals the packaged HPC layout length.
 
 An optional run-length sidecar can supply fallback lengths for uncovered runs. Without it, the canonical inverse is length 1 and the call is marked `NO_EVIDENCE`.
 

@@ -45,10 +45,8 @@ The promoted features no longer need experimental flags:
 
 Use `--hp-flank-bases N` to change the flank distance. `--hp-realign` and
 `--linked-events` explicitly enable their defaults; the last occurrence of
-these enable/disable controls wins. The old `--experiment-hp-realign` and
-`--experiment-hp-flank-bases` spellings remain compatibility aliases but are
-not needed in new commands. Unrelated experiments remain off. No corroboration
-model is used; optional ordinary tier models still apply.
+these enable/disable controls wins. Only the standard option names are
+accepted. No corroboration model is used; optional ordinary tier models still apply.
 
 ## Build with Make
 
@@ -63,8 +61,6 @@ When installed as `verkko/src/hpc-consensus`, the Makefile finds headers in
 ```sh
 make -j 4
 make test
-# Optional: copy into Verkko's build/bin:
-make install
 ```
 
 The standalone executable is `build/bin/hpc-consensus`; objects are in `build/obj`.
@@ -79,9 +75,12 @@ make test VERKKO_ROOT=/path/to/verkko
 `PYTHON` can be overridden. Compiler selection is left to Make and the caller;
 there is no compiler discovery. Set `CXX` in the environment or on the command
 line when needed, using a C++20 compiler with OpenMP compatible with Verkko.
+The standard flag defaults to `-std=c++2a`, the spelling accepted by GCC 9
+and newer GCC/Clang. Override `CXX_STANDARD` if needed; the Makefile does not
+select or replace your compiler.
 `OPENMP_FLAGS` and `OPENMP_LIBS` default to `-fopenmp` for compile and link.
 Set `VERKKO_BUILD` for a custom parent build directory, `VERKKO_LIB` for an
-explicit archive, and `BINDIR` for installation. Use a fresh `BUILD_DIR` or
+explicit archive. Use a fresh `BUILD_DIR` or
 `make clean` when changing compiler or flags.
 
 ### Parent Verkko integration
@@ -92,14 +91,13 @@ the submodule. An example recipe, to adapt in Verkko's makefiles:
 ```make
 # Dependency: $(TARGET_DIR)/lib/libverkko.a
 $(MAKE) -C hpc-consensus CXX="$(CXX)" \
-  VERKKO_BUILD="$(abspath $(TARGET_DIR))" DESTDIR= install
+  VERKKO_BUILD="$(abspath $(TARGET_DIR))"
 ```
 
 The submodule never invokes the parent build, fetches dependencies, or edits
-Verkko. This avoids recursive build cycles. `make install` copies only the
-executable; models are optional external files and are not installed implicitly.
-`DESTDIR` stages installation under `BINDIR`; the parent should pass its
-actual build path with `VERKKO_BUILD`, not reuse its staging variable as a root.
+Verkko. This avoids recursive build cycles. The executable remains at the
+submodule's `build/bin/hpc-consensus`; the parent controls packaging or copying
+it elsewhere. Models remain optional external files.
 
 ## Inputs
 
@@ -110,14 +108,11 @@ actual build path with `VERKKO_BUILD`, not reuse its staging variable as a root.
   does not embed these sequences, so this companion file is normally required.
   Embedded tig bases are accepted as an HPC template if present. If both sources
   are supplied, they must agree.
-- `--tig-map packages.tigName_to_ID.map` associates template FASTA names with
-  packaged IDs using whitespace-separated `internal_ID FASTA_name` rows. For
-  example, `109 piece000111` selects `>piece000111` for internal tig 109.
-  Verkko's `tigID  tig name` heading and dashed separator are accepted, as are
-  headerless maps, blank lines, and full-line `#` comments; duplicate IDs/names and
-  malformed rows are rejected. A supplied map is authoritative (no suffix fallback).
-  Without a map, numeric IDs, `tig00000109`, and legacy `piece000109` names are
-  recognized directly. Automatic scfmap/GFA-path association is not implemented.
+- Template FASTA names must encode the packaged tig ID: numeric IDs,
+  `tig00000109`, and legacy `piece000109` names are recognized directly.
+  The numeric suffix must match the internal ID; arbitrary names and differently
+  numbered pieces are not translated. No tig-name map is required or accepted.
+  Automatic scfmap/GFA-path association is not implemented.
   All output references use `tig` plus the internal ID zero-padded to eight digits
   (`tig00000109`), consistently in FASTA, CRAM, VCF, and diagnostics. Larger IDs
   retain all digits rather than being truncated.
@@ -357,14 +352,10 @@ are resolved by minimum total absolute distance to observations, then smaller
 length. Without a tier model this is an empirical vote, not a fitted predictor. Quality priority is
 entirely user-specified by tiers, not per-base quality scores.
 
-`--experiment-run-mean` instead rounds the empirical mean of the selected
-distribution. This is an experimental diagnostic, not a validated accuracy
-improvement; the modal caller remains the default. `.run-calls.tsv` reports
-`placement_class` as UNIQUE, AMBIGUOUS, POOLED (both placement classes), or NONE.
-Summary JSON counts `ambiguous_run_calls`, including POOLED calls. Depth and
-peak refer to the selected histogram, including both classes when pooled.
-The `peak` column is still the histogram's
-modal count, including when the experimental mean is used.
+`.run-calls.tsv` reports `placement_class` as UNIQUE, AMBIGUOUS, POOLED (both
+placement classes), or NONE. Summary JSON counts `ambiguous_run_calls`,
+including POOLED calls. Depth and peak refer to the selected histogram,
+including both classes when pooled; peak is the modal observation count.
 
 #### Regional fixtures
 
@@ -596,8 +587,7 @@ technology defaults. Validate a model after changing the read-generation or
 correction pipeline. The repository includes `models/revio.run-model.tsv`; it is used only when
 explicitly selected with `--tier-model`, not automatically. Mode remains the fallback
 below the model's minimum depth, for an unmodeled base, or when the original
-modal length is outside that base's calibrated range. Models cannot be combined
-with `--experiment-run-mean`. The summary reports `model_changed_runs`, and
+modal length is outside that base's calibrated range. The summary reports `model_changed_runs`, and
 `.models.tsv` records tier-to-file associations. Run-call `peak` remains the
 modal observation count, **not** a calibrated confidence score.
 

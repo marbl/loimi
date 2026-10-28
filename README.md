@@ -437,16 +437,27 @@ Only reads anchored to the existing terminal sequence can establish an extension
 (at least 20 aligned operations, with the terminal 100-operation error fraction
 at most `--max-error`). A molecule counts once per end, even with duplicate
 placements; unknown placement counts cannot vote. A high-priority group with
-at least `--min-end-support` molecules supplies a seed path. Anchored HPC tail
-alignments collect run lengths, using unique-first then same-tier pooled
-selection and the supplied calibration models. Unlike interior calling, every
+at least `--min-end-support` molecules supplies a seed path. Up to three bounded
+rounds of anchored HPC alignment correct that path's substitutions, insertions,
+and deletions. Each path position uses the first tier with sufficient depth,
+trying unique evidence before same-tier pooling; a strict majority chooses the
+allele, and an unresolved tie retains the seed allele. A qualifying higher-tier
+conflict cannot be overridden by lower-tier evidence. Partial terminal runs do
+not vote. Repeated paths terminate refinement rather than oscillating.
+
+Tied prefix endpoints are resolved to the shortest optimal endpoint locally:
+the read is already anchored to this contig end, so these are not alternative
+genomic placements. Global template-offset uniqueness checks are unchanged.
+Reads are realigned to the corrected HPC path to collect run lengths, using
+unique-first then same-tier pooled selection and the supplied calibration
+models. Unlike interior calling, every
 added run must reach the end-support threshold: there is no sparse fallback.
 The last run of each tail is excluded because it may be truncated. Recovery
-stops at the first unsupported seed run or the raw-base cap.
+stops at the first unsupported corrected-path run or the raw-base cap.
 
 This is conservative seeded extension, not de novo assembly of arbitrary tails:
-it cannot recover a path absent from its chosen seed, may stop early at a seed
-error, and does not establish a telomere's exact biological repeat count. Read
+it may still stop early where path alignment or read support is insufficient,
+and does not establish a telomere's exact biological repeat count. Read
 overhangs, including chimeric tails, still require inspection in difficult cases.
 The cap bounds terminal-tail scratch, not total process RSS. Recovered tails
 are aligned to the added sequence and remaining/unresolved bases stay soft-clipped.

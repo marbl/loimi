@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT-0
 #include "core.hpp"
+#include "align/edlib.H"
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <stdexcept>
 
@@ -13,25 +15,116 @@ struct Prefix {
   size_t query, reference;
 };
 Prefix prefix(const std::string &q, const std::string &r, double rate) {
-  if (q.empty() || r.empty())
-    throw std::runtime_error("Empty terminal alignment");
-  if (q.size() >= r.size()) {
-    auto a = align_boundary(q, r, false, true, rate);
-    return {std::move(a.ops), a.query_end, r.size()};
+  if (q.empty() || r.empty() || q.size() > INT32_MAX || r.size() > INT32_MAX)
+    throw std::runtime_error("Invalid terminal alignment length");
+  // Both starts are already anchored to the same biological boundary. Tied
+  // prefix endpoints in a repeat are not alternative genomic placements.
+  // Edlib traces its first (shortest) optimal endpoint; never choose a longer
+  // repeat traversal simply to increase extension length. Keep this policy
+  // local: offset inference must still reject ambiguous genomic placements.
+  bool swapped = q.size() >= r.size();
+  const auto &small = swapped ? r : q;
+  const auto &large = swapped ? q : r;
+  auto a = merylutil::edlibAlign(small.data(), small.size(), large.data(), large.size(),
+                                 merylutil::edlibNewAlignConfig(int(std::ceil(rate * small.size())),
+                                                                merylutil::EDLIB_MODE_SHW,
+                                                                merylutil::EDLIB_TASK_PATH));
+  if (a.editDistance < 0 || !a.numLocations || !a.alignment) {
+    merylutil::edlibFreeAlignResult(a);
+    throw std::runtime_error("Unresolved terminal prefix alignment");
   }
-  auto a = align_boundary(r, q, false, true, rate);
-  for (char &c : a.ops)
-    if (c == 'I')
-      c = 'D';
-    else if (c == 'D')
-      c = 'I';
-  return {std::move(a.ops), q.size(), a.query_end};
+  Prefix out{{},
+             swapped ? size_t(a.endLocations[0] + 1) : q.size(),
+             swapped ? r.size() : size_t(a.endLocations[0] + 1)};
+  for (int i = 0; i < a.alignmentLength; ++i)
+    out.ops += (swapped ? "=DIX" : "=IDX")[a.alignment[i]];
+  merylutil::edlibFreeAlignResult(a);
+  return out;
 }
 struct Tail {
   Alignment *alignment;
   bool unique;
   std::string sequence;
 };
+
+using PathVotes = std::map<std::string, unsigned>;
+
+// Select a supported path allele, including the empty string (deletion).
+// Unique tiers precede within-tier pooling. A qualifying tier with conflicting
+// evidence vetoes a change; lower tiers cannot override it. Strict majority
+// avoids creating a path from a minority allele in a noisy terminal repeat.
+std::string path_allele(const std::vector<PathVotes> &votes, size_t nt, unsigned support,
+                        bool ambiguous, const std::string &fallback) {
+  for (size_t phase = 0; phase < (ambiguous ? 2u : 1u); ++phase)
+    for (size_t t = 0; t < nt; ++t) {
+      auto counts = votes[t];
+      if (phase)
+        for (const auto &[allele, n] : votes[nt + t])
+          counts[allele] += n;
+      size_t depth = 0, best = 0;
+      std::string allele;
+      for (const auto &[s, n] : counts) {
+        depth += n;
+        if (n > best) {
+          best = n;
+          allele = s;
+        }
+      }
+      if (depth >= support)
+        return best > depth / 2 ? allele : fallback;
+    }
+  return fallback;
+}
+
+// Repair only the bounded extension's HPC path. Each read contributes one
+// allele per consumed reference run: insertions before that run followed by
+// its aligned base, or an empty allele for deletion. Terminal partial query
+// runs and unanchored trailing insertions do not vote. Re-encoding after edits
+// merges neighboring equal bases before run-length estimation.
+std::string repair_path(std::string target, const std::vector<Tail> &tails, size_t nt,
+                        unsigned support, size_t limit, double rate, bool ambiguous) {
+  std::set<std::string> visited{target};
+  constexpr unsigned max_rounds = 3;
+  for (unsigned round = 0; round < max_rounds && !target.empty(); ++round) {
+    std::vector<std::vector<PathVotes>> votes(target.size(), std::vector<PathVotes>(2 * nt));
+    for (const auto &x : tails) {
+      if (!x.unique && !ambiguous)
+        continue;
+      auto q = encode(x.sequence);
+      try {
+        auto a = prefix(q.bases, target, rate);
+        size_t qi = 0, ri = 0;
+        std::string allele;
+        for (char op : a.ops) {
+          if (op != 'D')
+            allele += q.bases[qi];
+          if (op != 'I') {
+            // A deletion also needs a following query base: do not turn read
+            // exhaustion into support for deleting the remaining seed suffix.
+            if (qi + 1 < q.bases.size() && allele.find('N') == std::string::npos)
+              ++votes[ri][x.alignment->tier + (x.unique ? 0 : nt)][allele];
+            allele.clear();
+            ++ri;
+          }
+          qi += op != 'D';
+        }
+      } catch (const std::runtime_error &) {
+        // A tail exceeding the alignment error bound supplies no path votes.
+      }
+    }
+    std::string next;
+    for (size_t i = 0; i < target.size(); ++i) {
+      next += path_allele(votes[i], nt, support, ambiguous, target.substr(i, 1));
+      if (next.size() > limit)
+        return target; // Bound intermediate paths as well as emitted raw bases.
+    }
+    next = encode(next).bases;
+    if (next == target || !visited.insert(next).second)
+      break;
+    target = std::move(next);
+  }
+  return target;
+}
 std::string tail(const EndRead &r, bool left, size_t limit) {
   const auto &a = *r.alignment;
   size_t n = std::min(left ? r.left : r.right, limit);
@@ -73,7 +166,8 @@ std::string consensus(const std::vector<Tail> &tails, size_t nt,
     }
   if (!seed)
     return {};
-  auto target = encode(seed->sequence);
+  auto target =
+      encode(repair_path(encode(seed->sequence).bases, tails, nt, support, limit, rate, ambiguous));
   // Bounded by --max-end-extension and terminal coverage. Unlike chromosome
   // storage, this small local pileup can retain every tier simultaneously.
   std::vector<std::vector<Histogram>> votes(target.bases.size(), std::vector<Histogram>(2 * nt));

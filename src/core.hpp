@@ -120,7 +120,10 @@ struct EndExtension {
   size_t left_candidates = 0, right_candidates = 0;
 };
 // Extend real template ends with anchored overhangs, requiring support at EVERY
-// added run (no sparse fallback). Update coordinates, clips and compact traces.
+// added run (no sparse fallback). Repair the bounded seed's HPC path using
+// tiered majority evidence before calling run lengths. Tied anchored prefix
+// endpoints use the shortest optimum, independently of global offset rules.
+// Update coordinates, clips and compact traces.
 // Internal reference sequence is unchanged. Left tails are reversed, not
 // complemented. Memory depends on bounded terminal tails, not chromosome size.
 EndExtension extend_ends(std::string &reference, const std::vector<EndRead> &reads, size_t tiers,

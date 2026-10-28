@@ -520,12 +520,17 @@ hpc-consensus/
   tests/           synthetic and replay corpus
 ```
 
-Dependencies should remain small:
+The following was the proposed dependency set, not the implemented inventory:
 
 - the in-tree Verkko/Canu store and utility compatibility layer for `.cnspack` reading;
 - htslib for companion FASTA and optional SAM/CRAM writing/indexing;
 - ksw2 for pairwise alignment;
 - zlib/libdeflate as inherited through htslib.
+
+The current caller instead uses Edlib through `libverkko.a` for pairwise
+alignment and invokes SAMtools for final CRAM output. HTSlib/HTSCodecs can also
+be linked transitively through that archive. ksw2 is not an implemented backend.
+See [CREDITS.md](CREDITS.md) for the audited dependency and attribution inventory.
 
 Do not copy Canu's consensus implementation into the new tool. The `.cnspack` compatibility layer should be limited to the minimum package/store records already used by Verkko and reviewed file-by-file for licensing; the consensus, caller, and alignment code remain independent. Canu is useful algorithmic context, but its repository includes GPL-covered components while Verkko's project code is public domain and LJA is BSD-3-Clause.
 

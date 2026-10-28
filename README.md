@@ -9,6 +9,9 @@ Linked dependencies, including Verkko/Canu and their bundled libraries, retain
 their own licenses; this license does not relicense them or replace their
 distribution requirements.
 
+See [CREDITS.md](CREDITS.md) for algorithmic influences, upstream developers,
+libraries actually used, evaluation tools, and suggested scientific citations.
+
 Repository engineering expectations are in [AGENTS.md](AGENTS.md). C++ formatting
 and the module map, invariants and regression workflow are described in
 [MAINTAINING.md](MAINTAINING.md). Formatting

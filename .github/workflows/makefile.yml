@@ -1,0 +1,69 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Linux / GCC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CC: gcc
+      CXX: g++
+      VERKKO_ROOT: ${{ github.workspace }}/verkko
+    defaults:
+      run:
+        shell: bash
+        working-directory: hpc-consensus
+    steps:
+      - name: Check out consensus
+        uses: actions/checkout@v7
+        with:
+          path: hpc-consensus
+          persist-credentials: false
+
+      # Keep native cnspack readers and test package writers on the same ABI.
+      # This is the Verkko revision used for the local regression suite.
+      - name: Check out Verkko dependency
+        uses: actions/checkout@v7
+        with:
+          repository: marbl/verkko
+          ref: cb69f969eebfa2b2a74003a120edabf2b084248f
+          path: verkko
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config python3 samtools \
+            libssl-dev libcurl4-openssl-dev liblzma-dev libbz2-dev zlib1g-dev
+
+      - name: Build native package tools and library
+        # Absolute targets match Verkko's Makefile. Avoid the full assembler
+        # build: tests only need these tools and their libverkko.a prerequisite.
+        run: |
+          make -C "$VERKKO_ROOT/src" -j2 \
+            "$VERKKO_ROOT/build/bin/sqStoreCreate" \
+            "$VERKKO_ROOT/build/bin/layoutToPackage"
+          test -s "$VERKKO_ROOT/build/lib/libverkko.a"
+
+      - name: Build consensus
+        run: make -j2
+
+      - name: Run all tests, including native package and CRAM checks
+        # Fixtures are generated locally; no genome datasets are downloaded.
+        run: |
+          samtools --version
+          make -j2 test

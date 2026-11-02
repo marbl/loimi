@@ -281,7 +281,16 @@ treated as local coordinate uncertainty, not competing repeat copies.
 These are heuristic consistency checks, not calibrated confidence probabilities;
 consensus tier voting and MAPQ are unchanged. Region mode rereads the
 package with the same bounded ID sample only if its initial anchors fail.
-Unresolved offsets are never guessed.
+If every tier remains unresolved, a final repeat-specific tie-break verifies
+an exact period spanning at least two copies across the **entire** HPC template.
+Only equally supported candidates separated by whole repeat units (allowing
+at most 20 HPC bases of phase drift, further capped at one quarter-period) can
+use this fallback. The smallest valid offset wins that tie. A better-supported
+later offset, including one resolved by a later tier, always takes precedence.
+Partially repetitive templates and incompatible repeat phases still fail.
+Period discovery tests at most 128 prefix matches and uses no chromosome-sized
+scratch array. This is a deterministic coordinate convention for equivalent
+repeat copies, not evidence that a particular biological copy was identified.
 
 #### Boundary reads and small tigs
 
@@ -290,14 +299,19 @@ are aligned semi-globally to their overlapping HPC template interval. Overhangs
 are clipped at aligned run boundaries and represented as soft clips in CRAM;
 they do not extend the template during this initial alignment. Eligible
 soft-clipped overhangs can subsequently support end extension. Left, right, and two-sided
-overhangs are supported. Ambiguous best endpoints or excessive alignment error
+overhangs are supported. For repeat-rescued origins, query clipping is aligned
+near the layout-predicted position with at most 256 HPC bases of adjustment,
+strictly less than half the verified period. Optimal endpoints within that
+window are resolved by proximity to the prediction, then smaller query start;
+an alignment cannot jump to another repeat copy. Other offset methods keep
+their existing alignment rules. Ambiguous best endpoints or excessive alignment error
 produce `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
 `OUTSIDE_TEMPLATE`. Existing raw clipping is retained. If it cuts through a run
 (the adjacent clipped base is identical), that partial run cannot vote for a
 run length. The old global `--template-offset` option has been removed.
 `PREFIX.template-offsets.tsv` records offsets, attempts, placements, validation
 support, tolerance, and method (`VALIDATED`, `SPARSE`, `INTERNAL_OVERLAP`,
-`LAYOUT_OVERLAP`, or `SINGLE_READ`). For `LAYOUT_OVERLAP`, placements and
+`LAYOUT_OVERLAP`, `REPEAT_LAYOUT`, or `SINGLE_READ`). For `LAYOUT_OVERLAP`, placements and
 validation support count supporting molecules, and tolerance reports the
 256-HPC-base proposal span. For `INTERNAL_OVERLAP`, they count supporting reads
 and successful coordinate-constrained overlap checks, not held-out reads.

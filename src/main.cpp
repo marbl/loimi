@@ -84,6 +84,7 @@ struct Work {
   Alignment a;
   size_t hbegin = 0, hend = 0;
   size_t original_clip_left = 0, original_clip_right = 0;
+  size_t predicted_query_begin = 0;
   Rle rle;
   std::string trace, reason;
   bool boundary_left = false, boundary_right = false;
@@ -132,6 +133,7 @@ struct Offset {
   bool sparse = false;
   bool internal = false;
   bool layout_rescue = false;
+  size_t repeat_period = 0;
 };
 static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const std::string &ref,
                            double max_error, size_t eligible_count = SIZE_MAX,
@@ -285,21 +287,25 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
     rows.push_back(std::move(row));
   }
   try {
-    auto choice = choose_joint_offset(candidates, rows);
+    auto choice = choose_joint_offset(candidates, rows, ref);
     out.value = choice.value;
     out.layout_rescue = true;
+    out.repeat_period = choice.repeat_period;
     out.attempted = selected.size();
     out.placed = out.validated = choice.support;
     std::cerr << "offset joint rescue: offset=" << choice.value << " support=" << choice.support
               << " informative=" << choice.informative << " runner_up=" << choice.runner_up
-              << " candidates=" << candidates.size() << " tier=" << choice.tier << '\n';
+              << " candidates=" << candidates.size() << " tier=" << choice.tier
+              << " repeat_period=" << choice.repeat_period << '\n';
     return out;
   } catch (const std::runtime_error &e) {
     std::cerr << "offset joint rescue: " << e.what() << '\n';
   }
-  throw std::runtime_error("Cannot infer reliable template offset from " +
-                           std::to_string(out.attempted) + " reads (" +
-                           std::to_string(estimates.size()) + " unique placements)");
+  throw std::runtime_error(
+      "Cannot infer reliable template offset: " + std::to_string(seeds.size()) +
+      " unique eligible placements, " + std::to_string(out.attempted) + " initial read attempts, " +
+      std::to_string(estimates.size()) + " successful initial locations, " +
+      std::to_string(rows.size()) + " joint-rescue placement rows");
 }
 // Region mode normally retains only its established unique fast-path anchors.
 // On failure, reread the package with a bounded per-tier sample of known reads.
@@ -606,7 +612,8 @@ int main(int argc, char **argv) {
         } catch (const std::runtime_error &) {
           seeds.clear();
           auto rescue = region_rescue_reads(o, occurrences, declared);
-          region_offset = infer_offset(rescue, t.length(), template_seq, o.max_error, eligible, true);
+          region_offset =
+              infer_offset(rescue, t.length(), template_seq, o.max_error, eligible, true);
         }
         // At least one raw base per run guarantees this prefix reaches END.
         // Keep full overlapping placements as context so artificial boundaries
@@ -776,10 +783,11 @@ int main(int argc, char **argv) {
       outputs[".template-offsets.tsv"]
           << name << '\t' << offset << '\t' << inferred.attempted << '\t' << inferred.placed << '\t'
           << inferred.validated << '\t' << (inferred.layout_rescue ? offset_local_span : 20) << '\t'
-          << (inferred.layout_rescue ? "LAYOUT_OVERLAP"
-              : inferred.internal    ? "INTERNAL_OVERLAP"
-              : inferred.sparse      ? "SPARSE"
-                                     : "VALIDATED")
+          << (inferred.repeat_period   ? "REPEAT_LAYOUT"
+              : inferred.layout_rescue ? "LAYOUT_OVERLAP"
+              : inferred.internal      ? "INTERNAL_OVERLAP"
+              : inferred.sparse        ? "SPARSE"
+                                       : "VALIDATED")
           << '\n';
       std::cerr << "tig " << name << ": inferred template offset " << offset << " from "
                 << inferred.placed << " reads\n";
@@ -793,6 +801,7 @@ int main(int argc, char **argv) {
           else {
             w.boundary_left = b < 0;
             w.boundary_right = e > int64_t(ref.size());
+            w.predicted_query_begin = b < 0 ? size_t(-b) : 0;
             w.hbegin = std::max<int64_t>(0, b);
             w.hend = std::min<int64_t>(ref.size(), e);
           }
@@ -874,8 +883,12 @@ int main(int argc, char **argv) {
               w.rle = encode(seq);
               auto target = ref.substr(w.hbegin, w.hend - w.hbegin);
               if (w.boundary_left || w.boundary_right) {
-                auto a = align_boundary(w.rle.bases, target, w.boundary_left, w.boundary_right,
-                                        o.max_error);
+                auto a = inferred.repeat_period
+                             ? align_repeat_boundary(w.rle.bases, target, w.boundary_left,
+                                                     w.boundary_right, w.predicted_query_begin,
+                                                     inferred.repeat_period, o.max_error)
+                             : align_boundary(w.rle.bases, target, w.boundary_left,
+                                              w.boundary_right, o.max_error);
                 size_t b = w.rle.offsets.at(a.query_begin), e = w.rle.offsets.at(a.query_end);
                 // Convert aligned run bounds to raw bases before dropping the RLE
                 // scratch. Existing raw clips are additive and retain SAM orientation.
@@ -1068,10 +1081,10 @@ int main(int argc, char **argv) {
               << '\t' << c.length << '\t'
               << (c.tier < 0 ? "NO_EVIDENCE" : o.tiers[c.tier % o.tiers.size()].label) << '\t'
               << c.depth << '\t' << c.peak << '\t'
-              << (c.tier < 0                 ? "NONE"
-                  : (selected_flags[i] & 4)  ? "POOLED"
-                  : ambiguous_call           ? "AMBIGUOUS"
-                                             : "UNIQUE")
+              << (c.tier < 0                ? "NONE"
+                  : (selected_flags[i] & 4) ? "POOLED"
+                  : ambiguous_call          ? "AMBIGUOUS"
+                                            : "UNIQUE")
               << '\n';
       }
       std::vector<Call>().swap(selected);

@@ -25,7 +25,8 @@ struct OffsetEvidence {
 struct OffsetChoice {
   int64_t value = 0;
   size_t support = 0, informative = 0, runner_up = 0;
-  int tier = -1; // first decisive tier; lower tiers cannot override it
+  int tier = -1;            // first decisive tier; lower tiers cannot override it
+  size_t repeat_period = 0; // nonzero only for verified periodic-template tie rescue
 };
 // Failure-only joint inference. Scores refer to a fixed predicted query window;
 // an alignment cannot search another repeat copy. Invalid/nonoverlapping scores
@@ -52,7 +53,17 @@ OffsetScore score_offset_overlap(const std::string &query, const std::string &re
 // cannot increase independent support. Inconclusive tiers fall through; throws
 // if no tier has sufficient corroboration, majority support and a resolved locus.
 OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
-                                 const std::vector<OffsetRow> &rows);
+                                 const std::vector<OffsetRow> &rows,
+                                 const std::string &reference = {});
+// Verify an exact period spanning at least two copies over the ENTIRE template.
+// Bounded candidate search; returns zero when no period is proven.
+size_t template_repeat_period(const std::string &reference);
+struct BoundaryAlignment;
+// Align an already placed repeat read near its predicted query start. The
+// adjustment is capped below half a repeat to prevent jumps to adjacent copies.
+BoundaryAlignment align_repeat_boundary(const std::string &query, const std::string &reference,
+                                        bool left, bool right, size_t predicted_begin,
+                                        size_t period, double max_error);
 // Stable bounded sampling shared by whole-tig and region planning.
 uint64_t offset_sample_key(uint32_t id);
 // Whole shorter-sequence alignment first; distant tied loci remain unresolved.

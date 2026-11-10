@@ -176,6 +176,32 @@ OffsetScore score_offset_overlap(const std::string &q, const std::string &r, int
   return edits < 0 ? OffsetScore{} : OffsetScore{size_t(hi - lo), size_t(edits)};
 }
 
+OffsetScore score_offset_overlap_local(const std::string &q, const std::string &r, int64_t begin,
+                                       int64_t end, int64_t offset, double rate) {
+  auto b = begin - offset, e = end - offset;
+  auto lo = std::max<int64_t>(0, b), hi = std::min<int64_t>(r.size(), e);
+  int64_t qb = std::max<int64_t>(0, -b);
+  int64_t qe = e <= int64_t(r.size()) ? int64_t(q.size())
+                                      : std::min<int64_t>(q.size(), int64_t(r.size()) - b);
+  if (hi - lo < 1000 || qb >= qe || qe - qb > INT32_MAX || hi - lo > INT32_MAX)
+    return {};
+  // Remove only the uncertain terminal coordinates from the scored reference.
+  // The query window stays fixed: HW alignment can adjust each endpoint by at
+  // most radius, but cannot search the rest of an enclosing repetitive read.
+  int64_t radius = std::min<int64_t>(offset_local_span, (hi - lo) / 8);
+  auto length = hi - lo - 2 * radius;
+  auto a = merylutil::edlibAlign(r.data() + lo + radius, int(length), q.data() + qb, int(qe - qb),
+                                 merylutil::edlibNewAlignConfig(int(std::ceil(rate * length)),
+                                                                merylutil::EDLIB_MODE_HW,
+                                                                merylutil::EDLIB_TASK_LOC));
+  bool valid = false;
+  for (int i = 0; a.editDistance >= 0 && i < a.numLocations; ++i)
+    valid |= a.startLocations[i] <= 2 * radius && a.endLocations[i] + 1 >= qe - qb - 2 * radius;
+  int edits = a.editDistance;
+  merylutil::edlibFreeAlignResult(a);
+  return valid ? OffsetScore{size_t(length), size_t(edits)} : OffsetScore{};
+}
+
 bool validate_offset_overlap(const std::string &q, const std::string &r, int64_t begin, int64_t end,
                              int64_t offset, double rate) {
   return score_offset_overlap(q, r, begin, end, offset, rate).overlap != 0;
@@ -259,13 +285,12 @@ size_t template_repeat_period(const std::string &reference) {
   return 0;
 }
 
-BoundaryAlignment align_repeat_boundary(const std::string &q, const std::string &r, bool left,
-                                        bool right, size_t predicted_begin, size_t period,
+BoundaryAlignment align_layout_boundary(const std::string &q, const std::string &r, bool left,
+                                        bool right, size_t predicted_begin, size_t radius,
                                         double rate) {
-  if (q.empty() || r.empty() || (!left && !right) || period < 2 || predicted_begin >= q.size() ||
-      q.size() > INT32_MAX || r.size() > INT32_MAX)
-    throw std::runtime_error("Invalid repeat boundary alignment");
-  size_t radius = std::min<size_t>(offset_local_span, (period - 1) / 2);
+  if (q.empty() || r.empty() || (!left && !right) || radius > size_t(offset_local_span) ||
+      predicted_begin >= q.size() || q.size() > INT32_MAX || r.size() > INT32_MAX)
+    throw std::runtime_error("Invalid layout boundary alignment");
   size_t qb = left ? predicted_begin : 0;
   size_t qe = right ? std::min(q.size(), qb + r.size()) : q.size();
   size_t lo = left && qb > radius ? qb - radius : 0;
@@ -304,8 +329,17 @@ BoundaryAlignment align_repeat_boundary(const std::string &q, const std::string 
   }
   merylutil::edlibFreeAlignResult(a);
   if (best == SIZE_MAX)
-    throw std::runtime_error("No repeat boundary alignment near layout prediction");
+    throw std::runtime_error("No boundary alignment near layout prediction");
   return {align(q.substr(begin, end - begin), r, rate), begin, end};
+}
+
+BoundaryAlignment align_repeat_boundary(const std::string &q, const std::string &r, bool left,
+                                        bool right, size_t predicted_begin, size_t period,
+                                        double rate) {
+  if (period < 2)
+    throw std::runtime_error("Invalid repeat boundary period");
+  return align_layout_boundary(q, r, left, right, predicted_begin,
+                               std::min<size_t>(offset_local_span, (period - 1) / 2), rate);
 }
 
 OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,

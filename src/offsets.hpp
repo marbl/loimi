@@ -48,6 +48,12 @@ std::vector<int64_t> offset_candidates(const std::vector<OffsetEvidence> &reads,
 OffsetScore score_offset_overlap(const std::string &query, const std::string &reference,
                                  int64_t layout_begin, int64_t layout_end, int64_t offset,
                                  double max_error);
+// Failure-only rescore allowing <=256 HPC bases of endpoint drift at the same
+// candidate locus. Scores a trimmed reference core; requires >=1000 original
+// overlap bases. Never searches outside the layout-predicted query overlap.
+OffsetScore score_offset_overlap_local(const std::string &query, const std::string &reference,
+                                       int64_t layout_begin, int64_t layout_end, int64_t offset,
+                                       double max_error);
 // Lower tiers corroborate higher-tier candidates. One molecule votes only in
 // its highest usable tier; repeated placements and corrected/raw UUID aliases
 // cannot increase independent support. Inconclusive tiers fall through; throws
@@ -59,6 +65,11 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
 // Bounded candidate search; returns zero when no period is proven.
 size_t template_repeat_period(const std::string &reference);
 struct BoundaryAlignment;
+// Restrict boundary alignment to a known layout locus, with endpoint movement
+// bounded by max_shift (0..256 HPC bases). Used after local-drift rescue.
+BoundaryAlignment align_layout_boundary(const std::string &query, const std::string &reference,
+                                        bool left, bool right, size_t predicted_begin,
+                                        size_t max_shift, double max_error);
 // Align an already placed repeat read near its predicted query start. The
 // adjustment is capped below half a repeat to prevent jumps to adjacent copies.
 BoundaryAlignment align_repeat_boundary(const std::string &query, const std::string &reference,

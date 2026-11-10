@@ -134,6 +134,7 @@ struct Offset {
   bool internal = false;
   bool layout_rescue = false;
   size_t repeat_period = 0;
+  bool local_drift = false;
 };
 static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const std::string &ref,
                            double max_error, size_t eligible_count = SIZE_MAX,
@@ -287,7 +288,25 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
     rows.push_back(std::move(row));
   }
   try {
-    auto choice = choose_joint_offset(candidates, rows, ref);
+    OffsetChoice choice;
+    try {
+      choice = choose_joint_offset(candidates, rows, ref);
+    } catch (const std::runtime_error &) {
+      // Fixed endpoints can turn small layout drift into apparent disagreement
+      // between repeat copies. Retry the same candidates, tiers and thresholds
+      // with bounded endpoint freedom, only after the original vote fails.
+      for (size_t j = 0; j < selected.size(); ++j) {
+        auto &w = work[selected[j]];
+        auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                           w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                     .bases;
+        for (size_t k = 0; k < candidates.size(); ++k)
+          rows[j].scores[k] =
+              score_offset_overlap_local(q, ref, w.hbegin, w.hend, candidates[k], max_error);
+      }
+      choice = choose_joint_offset(candidates, rows, ref);
+      out.local_drift = true;
+    }
     out.value = choice.value;
     out.layout_rescue = true;
     out.repeat_period = choice.repeat_period;
@@ -296,7 +315,8 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
     std::cerr << "offset joint rescue: offset=" << choice.value << " support=" << choice.support
               << " informative=" << choice.informative << " runner_up=" << choice.runner_up
               << " candidates=" << candidates.size() << " tier=" << choice.tier
-              << " repeat_period=" << choice.repeat_period << '\n';
+              << " local_drift=" << out.local_drift << " repeat_period=" << choice.repeat_period
+              << '\n';
     return out;
   } catch (const std::runtime_error &e) {
     std::cerr << "offset joint rescue: " << e.what() << '\n';
@@ -783,7 +803,8 @@ int main(int argc, char **argv) {
       outputs[".template-offsets.tsv"]
           << name << '\t' << offset << '\t' << inferred.attempted << '\t' << inferred.placed << '\t'
           << inferred.validated << '\t' << (inferred.layout_rescue ? offset_local_span : 20) << '\t'
-          << (inferred.repeat_period   ? "REPEAT_LAYOUT"
+          << (inferred.local_drift     ? "LOCAL_LAYOUT"
+              : inferred.repeat_period ? "REPEAT_LAYOUT"
               : inferred.layout_rescue ? "LAYOUT_OVERLAP"
               : inferred.internal      ? "INTERNAL_OVERLAP"
               : inferred.sparse        ? "SPARSE"
@@ -887,6 +908,10 @@ int main(int argc, char **argv) {
                              ? align_repeat_boundary(w.rle.bases, target, w.boundary_left,
                                                      w.boundary_right, w.predicted_query_begin,
                                                      inferred.repeat_period, o.max_error)
+                         : inferred.local_drift
+                             ? align_layout_boundary(w.rle.bases, target, w.boundary_left,
+                                                     w.boundary_right, w.predicted_query_begin,
+                                                     offset_local_span, o.max_error)
                              : align_boundary(w.rle.bases, target, w.boundary_left,
                                               w.boundary_right, o.max_error);
                 size_t b = w.rle.offsets.at(a.query_begin), e = w.rle.offsets.at(a.query_end);

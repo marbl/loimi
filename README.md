@@ -292,6 +292,19 @@ Period discovery tests at most 128 prefix matches and uses no chromosome-sized
 scratch array. This is a deterministic coordinate convention for equivalent
 repeat copies, not evidence that a particular biological copy was identified.
 
+If these checks still fail, the caller rescans the **same candidate origins**
+with bounded endpoint freedom. Small layout drift can otherwise penalize the
+correct repeat copy simply because predicted clipping endpoints are inexact.
+This failure-only pass requires at least 1,000 HPC bases of predicted overlap,
+trims up to 256 bases (at most one eighth of the overlap) from each reference
+end, and aligns that core inside the original predicted query overlap. Both
+aligned endpoints must remain within the same local uncertainty window.
+It applies the same molecule counting, tier order, majority, and ambiguity
+checks; it does not lower voting thresholds or search the rest of a long read.
+Successful rescues are recorded as `LOCAL_LAYOUT` in `template-offsets.tsv`
+and `local_drift=1` in the log. They add bounded per-read alignment work only
+for otherwise failing tigs, with no persistent per-read sequence copies.
+
 #### Boundary reads and small tigs
 
 Unresolved tigs fail explicitly. Reads crossing the inferred template boundary
@@ -303,7 +316,8 @@ overhangs are supported. For repeat-rescued origins, query clipping is aligned
 near the layout-predicted position with at most 256 HPC bases of adjustment,
 strictly less than half the verified period. Optimal endpoints within that
 window are resolved by proximity to the prediction, then smaller query start;
-an alignment cannot jump to another repeat copy. Other offset methods keep
+an alignment cannot jump to another repeat copy. Local-drift rescues also
+constrain query clipping to within 256 HPC bases of the layout prediction. Other offset methods keep
 their existing alignment rules. Ambiguous best endpoints or excessive alignment error
 produce `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
 `OUTSIDE_TEMPLATE`. Existing raw clipping is retained. If it cuts through a run

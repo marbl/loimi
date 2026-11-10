@@ -214,6 +214,63 @@ int main() {
     }
     check(refused);
   }
+  // Part012/tig357: fixed endpoints split four LAO reads across three repeat
+  // copies. Bounded endpoint freedom removes layout drift without lowering the
+  // existing tier-majority or independent-molecule requirements.
+  std::vector<int64_t> drift_candidates{10609, 42360, 74512};
+  std::vector<OffsetRow> fixed_rows{{"a", 1, true, {{42974, 366}, {42305, 438}, {10153, 168}}},
+                                    {"b", 1, true, {{17261, 689}, {42974, 122}, {42974, 267}}},
+                                    {"c", 1, true, {{14761, 497}, {42974, 280}, {42974, 126}}},
+                                    {"d", 1, false, {{2873, 347}, {18502, 246}, {}}},
+                                    {"e", 2, false, {{}, {18541, 348}, {}}},
+                                    {"f", 2, true, {{}, {29807, 602}, {29170, 398}}}};
+  bool drift_rejected = false;
+  try {
+    choose_joint_offset(drift_candidates, fixed_rows);
+  } catch (const std::runtime_error &) {
+    drift_rejected = true;
+  }
+  check(drift_rejected);
+  auto local_rows = fixed_rows;
+  local_rows[0].scores = {{42462, 238}, {41793, 79}, {9641, 2}};
+  local_rows[1].scores = {{16749, 141}, {42462, 80}, {42462, 111}};
+  local_rows[2].scores = {{14249, 41}, {42462, 86}, {42462, 76}};
+  local_rows[3].scores = {{2361, 0}, {17990, 27}, {}};
+  local_rows[4].scores = {{895, 8}, {18029, 179}, {}};
+  local_rows[5].scores = {{}, {29295, 355}, {28658, 324}};
+  check(choose_joint_offset(drift_candidates, local_rows).value == 42360);
+  // Better evidence at a later origin still wins; never default to the first.
+  for (auto &row : local_rows)
+    row.scores = {{4000, 100}, {4000, 50}, {4000, 0}};
+  check(choose_joint_offset(drift_candidates, local_rows).value == 74512);
+  for (auto &row : local_rows)
+    row.scores = {{4000, 0}, {4000, 0}, {4000, 0}};
+  bool local_tied = false;
+  try {
+    choose_joint_offset(drift_candidates, local_rows);
+  } catch (const std::runtime_error &) {
+    local_tied = true;
+  }
+  check(local_tied);
+  // Sequence-level contract: recover endpoint drift in either direction but
+  // do not reach a distant exact copy, or accept too little aligned sequence.
+  for (int delta : {-200, 0, 200}) {
+    auto local = score_offset_overlap_local(sequence, reference, 100, 12100, 3100 + delta, 0);
+    check(local.overlap == reference.size() - 512 && local.edits == 0);
+    auto boundary = align_layout_boundary(sequence, reference, true, true, 3000 + delta, 256, 0);
+    check(boundary.query_begin == 3000 && boundary.query_end == 9000);
+  }
+  check(!score_offset_overlap_local(sequence, reference, 100, 12100, 3700, 0).overlap);
+  check(!score_offset_overlap_local(sequence, reference, 100, 12100, 12100, .15).overlap);
+  check(!score_offset_overlap_local(sequence, reference.substr(0, 999), 100, 12100, 3100, .15)
+             .overlap);
+  bool distant = false;
+  try {
+    align_layout_boundary(sequence, reference, true, true, 3600, 256, 0);
+  } catch (const std::runtime_error &) {
+    distant = true;
+  }
+  check(distant);
   // Five independent supporters and one outlier satisfy the 75% rule.
   check(internal_offset_cluster({{3100, 3101}, {3100}, {3099}, {3102}, {3100}, {8000}}, 3) == 3100);
   check(internal_offset_cluster({{-500}}, 1) == -500);

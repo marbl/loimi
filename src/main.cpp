@@ -960,7 +960,10 @@ int main(int argc, char **argv) {
                       w.rle.offsets.at(q), w.rle.offsets.at(q + 1), w.rle.offsets.back(),
                       o.hp_flank_bases, operation > 0 && w.trace[operation - 1] == '=',
                       operation + 1 < w.trace.size() && w.trace[operation + 1] == '=', r == 0,
-                      r + 1 == ref.size(), left_context, right_context);
+                      r + 1 == ref.size() && ref.size() == complete_template_size, left_context,
+                      right_context, r < o.hp_flank_bases,
+                      ref.size() == complete_template_size &&
+                          ref.size() - r - 1 < o.hp_flank_bases);
                 // Stream only requested sites, retaining no per-read trace table.
                 // A row reports evidence eligibility, not whether this tier won.
                 if (o.evidence_read_votes && op != 'I' && r < evidence_mask.size() &&

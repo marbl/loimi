@@ -95,7 +95,7 @@ Options parse_options(int argc, char **argv) {
              "--polish-non-hpc      Optional conservative correction\n"
              "--extend-ends         Coverage-supported ends (also enabled by polishing)\n"
              "--no-extend-ends      Preserve template boundaries, including with polishing\n"
-             "--min-end-support N  Minimum molecules at every added run (default 5)\n"
+             "--min-end-support N  Minimum molecules at every added run (default 2)\n"
              "--max-end-extension N  Maximum raw bases per end (default 10000)\n"
              "--end-extension-side both|left|right (default both)\n"
              "--min-polish-support N (default 5)\n--min-polish-fraction F (default 0.9)\n"

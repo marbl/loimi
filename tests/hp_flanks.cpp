@@ -24,4 +24,12 @@ int main() {
   check(!has_span_flanks(2, 4, 1004, 500, false, true, false, false, 1000, 0));
   check(!has_span_flanks(2, 4, 1004, 500, true, true, false, false));
   check(!has_span_flanks(1000, 1002, 1004, 500, true, true, false, false));
+  // Terminal neighborhoods waive outward distance only. Adjacent matches,
+  // full inward context, and the original interior policy remain mandatory.
+  check(has_span_flanks(1000, 1003, 1153, 500, true, true, false, false, 0, 0, false, true));
+  check(has_span_flanks(150, 153, 1153, 500, true, true, false, false, 0, 0, true, false));
+  check(!has_span_flanks(1000, 1003, 1153, 500, true, false, false, false, 0, 0, false, true));
+  check(!has_span_flanks(150, 153, 1153, 500, false, true, false, false, 0, 0, true, false));
+  check(!has_span_flanks(150, 153, 303, 500, true, true, false, false, 0, 0, true, true));
+  check(!has_span_flanks(1000, 1003, 1153, 500, true, true, false, false));
 }

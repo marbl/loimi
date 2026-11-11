@@ -78,3 +78,36 @@ with tempfile.TemporaryDirectory(prefix='hpc-end-flank-') as tmp:
             run(['samtools','quickcheck',root/(arm+'.cram')])
             result=run(['samtools','calmd',root/(arm+'.cram'),root/(arm+'.fasta')])
             assert 'different' not in result.stderr
+
+    # Biological end reads can stop AT the template edge, with no clipped
+    # overhang to provide outward context. Both terminal neighborhoods must
+    # still expand correctly from their full inward anchors.
+    def package_subset(label, selected):
+        layout = root/(label+'.layout')
+        layout.write_text('tig\t'+label+'\nlen\t2500\nrds\t'+str(len(selected))+'\n'+
+                          ''.join(f'ends_{n}\t{b}\t{e}\t1\n'
+                                  for n,s,b,e in selected)+'end\n')
+        run([tools/'layoutToPackage','-layout',layout,'-store',root/'store',
+             '-output',root/(label+'#.cnspack')])
+        return next(root.glob(label+'*.cnspack'))
+
+    anchor_reads = [r for r in reads if r[0].startswith('anchor')]
+    terminal_package = package_subset('terminal', anchor_reads)
+    run([exe,'--import',terminal_package,'--template-hpc',root/'template.fa',
+         '--tier','all=*','--output',root/'terminal'])
+    assert sequence(root/'terminal.fasta') == double(core)
+
+    # Two independent tails now suffice by default, including reverse-oriented
+    # placements. A single tail still cannot extend unless explicitly allowed.
+    for depth in (1,2):
+        selected = anchor_reads + [r for r in reads if r[0] in
+                                    [f'{side}{i}' for side in ('left','right')
+                                     for i in range(depth)]]
+        package = package_subset(f'depth{depth}', selected)
+        for minimum in (None,3):
+            label = f'depth{depth}-support{minimum}'
+            flags = [] if minimum is None else ['--min-end-support',str(minimum)]
+            run([exe,'--import',package,'--template-hpc',root/'template.fa',
+                 '--tier','all=*','--extend-ends',*flags,'--output',root/label])
+            expected = double(left[1:]+core+right[:-1]) if depth==2 and minimum is None else double(core)
+            assert sequence(root/(label+'.fasta')) == expected, label

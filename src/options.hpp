@@ -27,7 +27,7 @@ struct Options {
   size_t max_indel = 500;
   bool polish = false, drop_unmatched = false, missing_error = false;
   bool extend = false, no_extend = false, extend_left = true, extend_right = true;
-  unsigned end_support = 5;
+  unsigned end_support = 2;
   size_t max_end_extension = 10000;
   bool ambiguous_fallback = true;
   bool region = false;

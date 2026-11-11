@@ -127,3 +127,9 @@ The fourth has two noisy reads in different tiers and no long exact anchors.
 Both full-package and region
 modes must finish with `--no-extend-ends`. No external genome data is needed.
 
+
+Terminal regressions also cover reads ending at the template edge without any
+overhang, default two-molecule extension versus one-molecule rejection and an
+explicit higher support threshold, and tied one-sided boundary endpoints.
+Negative cases preserve inward flank/adjacent-match requirements, interior
+short-read filtering, and two-sided placement ambiguity rejection.

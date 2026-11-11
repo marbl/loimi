@@ -149,7 +149,12 @@ BoundaryAlignment align_boundary(const std::string &query, const std::string &re
   auto a = merylutil::edlibAlign(r.data(), r.size(), q.data(), q.size(),
                                  merylutil::edlibNewAlignConfig(int(std::ceil(rate * r.size())),
                                                                 mode, merylutil::EDLIB_TASK_PATH));
-  if (a.editDistance < 0 || a.numLocations != 1 || !a.startLocations || !a.alignment) {
+  // In a one-sided alignment the inward start is fixed. Multiple optimal
+  // endpoints describe clipping uncertainty, not alternative genomic loci.
+  // Edlib traces the first (shortest) optimal endpoint; retain that conservative
+  // choice. Two-sided infix alignment still needs an unambiguous placement.
+  if (a.editDistance < 0 || a.numLocations < 1 || (left && right && a.numLocations != 1) ||
+      !a.startLocations || !a.alignment) {
     merylutil::edlibFreeAlignResult(a);
     throw std::runtime_error("Unresolved boundary alignment");
   }

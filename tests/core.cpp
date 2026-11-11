@@ -160,6 +160,28 @@ int main() {
         "Right overhang clipping");
   auto both = align_boundary("TGCACGTCAC", "ACGT", true, true, 0.15);
   check(both.query_begin == 3 && both.query_end == 7 && both.ops == "====", "Both overhangs");
+  // A fixed inward anchor with equal-scoring outer endpoints is clipping
+  // uncertainty. Choose the shortest optimal endpoint on either strand/end.
+  auto tied_right = align_boundary("ACGTACGTACGT", "ACGTACGA", false, true, .15);
+  check(tied_right.query_begin == 0 && tied_right.query_end == 7 && tied_right.ops == "=======D",
+        "One-sided tied right endpoint");
+  auto tied_left = align_boundary("TGCATGCATGCA", "AGCATGCA", true, false, .15);
+  check(tied_left.query_begin == 5 && tied_left.query_end == 12 && tied_left.ops == "D=======",
+        "One-sided tied left endpoint");
+  auto better_later = align_boundary("ACGTACGA", "ACGTACGA", false, true, .15);
+  check(better_later.query_end == 8 && better_later.ops == "========",
+        "Shorter endpoint cannot override better alignment");
+  for (bool two_sided : {false, true}) {
+    bool refused = false;
+    try {
+      // Two exact distant copies remain ambiguous in infix mode; prefix mode
+      // must not skip an incompatible inward anchor to reach a later match.
+      align_boundary(two_sided ? "ACGTACGT" : "TTTTACGT", "ACGT", two_sided, true, 0);
+    } catch (const std::runtime_error &) {
+      refused = true;
+    }
+    check(refused, "Boundary locus protection");
+  }
   check(locate("ACGT", "TTACGTAA", 0.15) == 2, "Infix location");
   check(locate("ACGT", "ACGTACGT", 0.15) == -1, "Repeated anchor rejected");
   check(offset_cluster({5608, 5609, 5608, 5608}) == 5608, "Offset cluster");

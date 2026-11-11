@@ -318,8 +318,11 @@ strictly less than half the verified period. Optimal endpoints within that
 window are resolved by proximity to the prediction, then smaller query start;
 an alignment cannot jump to another repeat copy. Local-drift rescues also
 constrain query clipping to within 256 HPC bases of the layout prediction. Other offset methods keep
-their existing alignment rules. Ambiguous best endpoints or excessive alignment error
-produce `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
+their existing alignment rules. For ordinary one-sided boundary alignments, the inward start is fixed: tied
+optimal outer endpoints are clipping uncertainty, and the shortest optimal
+endpoint is used. Two-sided infix alignments still reject ambiguous placements;
+an earlier endpoint never overrides a better-scoring later endpoint.
+Unresolved placement or excessive alignment error produces `HPC_ALIGNMENT_FAILED`; reads wholly outside the template produce
 `OUTSIDE_TEMPLATE`. Existing raw clipping is retained. If it cuts through a run
 (the adjacent clipped base is identical), that partial run cannot vote for a
 run length. The old global `--template-offset` option has been removed.
@@ -432,7 +435,14 @@ matching HPC run on each side of an interior observation. It does not require
 500 perfectly matching bases. Usable overhang clipped only by a true template
 boundary counts toward the distance, so the filter preserves end-extension
 support; package trimming does not count. Template endpoints waive only the
-outward-facing requirement. Singleton passthrough remains unchanged.
+outward-facing requirement. Near a biological end, the initial run caller also
+allows shorter outward context when the read supplies the full inward flank
+and adjacent matching HPC runs. Before expansion, raw template distances are
+unknown: this neighborhood is bounded to the first/last `N` HPC runs, where
+`N = --hp-flank-bases` (500 by default). The inward requirement remains `N`
+**raw read bases**; short reads cannot waive both sides. Internal processing
+crop boundaries are not biological ends. Interior filtering and singleton
+passthrough remain unchanged.
 
 HP realignment runs by default during polishing. It rebuilds evidence for uncertain or
 model-adjusted runs using 64-base local alignment context and 12 exact terminal
@@ -516,7 +526,7 @@ avoid treating the fixture's artificial opposite edge as a biological end.
 | `--min-run-support N` | 5 | Preferred tier depth; retain sparse evidence if none qualifies |
 | `--extend-ends` | with polishing | Recover coverage-supported template overhangs at both ends |
 | `--no-extend-ends` | off | Disable end recovery, including during polishing |
-| `--min-end-support N` | 5 | Distinct molecules required at every added run |
+| `--min-end-support N` | 2 | Distinct molecules required at every added run |
 | `--max-end-extension N` | 10000 | Raw-base cap per end, and per-read tail bound |
 | `--end-extension-side both\|left\|right` | both | Restrict recovery, useful for extracted fixtures |
 | `--missing-run one\|error` | one | Policy when no tier qualifies |

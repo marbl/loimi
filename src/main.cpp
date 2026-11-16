@@ -3,6 +3,7 @@
 // -> optional raw alignment/polish -> optional final-reference CRAM export.
 #include "core.hpp"
 #include "hp_refinement.hpp"
+#include "repeat_refinement.hpp"
 #include "hp_flanks.hpp"
 #include "offsets.hpp"
 #include "options.hpp"
@@ -89,6 +90,7 @@ struct Work {
   std::string trace, reason;
   bool boundary_left = false, boundary_right = false;
   bool unique = false;
+  bool force_raw_alignment = false;
   bool raw_alignment_attempted = false;
   unsigned placements = 0;
 };
@@ -440,6 +442,8 @@ int main(int argc, char **argv) {
     }
     std::vector<std::string> suffixes = {".fasta", ".run-calls.tsv", ".read-decisions.tsv",
                                          ".summary.json", ".template-offsets.tsv"};
+    if (o.repeat_refine)
+      suffixes.push_back(".repeat-refinement.tsv");
     if (o.hp_realign)
       suffixes.push_back(".hp-realignment.tsv");
     const bool extend = (o.polish || o.extend) && !o.no_extend;
@@ -487,6 +491,10 @@ int main(int argc, char **argv) {
       for (const auto &[label, path] : o.model_paths)
         outputs[".models.tsv"] << label << '\t' << path << '\n';
     }
+    if (o.repeat_refine)
+      outputs[".repeat-refinement.tsv"] << "tig\tcore_begin\tcore_end\twindow_begin\twindow_"
+                                           "end\tstatus\treads\tcandidates\ttier\tpooled\tscore_"
+                                           "before\tscore_after\tchanged_runs\n";
     calls << "tig\trun\tdraft_begin\tdraft_end\tbase\tlength\ttier\tdepth\tpeak\tplacement_class\n";
     if (!o.evidence_sites.empty())
       outputs[".run-evidence.tsv"] << "tig\trun\tbase\ttier\tplacement_class\tlength\tcount\n";
@@ -1011,7 +1019,7 @@ int main(int argc, char **argv) {
             w.rle = {};
             // clear() alone retains string capacity; swap releases no-longer-needed
             // storage. Never keep per-base traces for the entire chromosome.
-            if ((o.polish || extend || !o.cram.empty()) && w.reason.empty())
+            if ((o.repeat_refine || o.polish || extend || !o.cram.empty()) && w.reason.empty())
               w.trace = cigar(w.trace);
             else {
               std::string().swap(w.trace);
@@ -1086,6 +1094,42 @@ int main(int argc, char **argv) {
       }
       evidence.clear();
       std::vector<uint8_t>().swap(evidence_mask);
+      if (o.repeat_refine) {
+        RepeatConfig config;
+        config.max_window_bases = o.repeat_max_window;
+        config.max_reads = o.repeat_max_reads;
+        config.min_support = o.min_support;
+        config.ambiguous_fallback = o.ambiguous_fallback;
+        std::vector<RepeatRead> candidates;
+        for (auto &w : work)
+          if (w.reason.empty() && (w.unique || (o.ambiguous_fallback && w.placements > 1)))
+            candidates.push_back({&w.a, w.hbegin, w.hend, w.unique, w.placements});
+        auto changed = refine_repeats(
+            ref, selected, std::move(candidates), nt, models, config, [&](const RepeatDecision &d) {
+              for (auto update : d.updates) {
+                selected_flags[update.run] =
+                    1 | (update.model_changed ? 2 : 0) | (update.mixed ? 4 : 0);
+                if (o.hp_realign)
+                  realign_runs.insert(update.run);
+              }
+              outputs[".repeat-refinement.tsv"]
+                  << name << '\t' << d.core.begin << '\t' << d.core.end << '\t' << d.window.begin
+                  << '\t' << d.window.end << '\t' << d.status << '\t' << d.reads << '\t'
+                  << d.candidates << '\t' << d.tier << '\t' << d.pooled << '\t' << d.before_score
+                  << '\t' << d.after_score << '\t' << d.changed_runs << '\n';
+            });
+        for (auto &w : work) {
+          auto it = std::lower_bound(changed.begin(), changed.end(), w.hbegin,
+                                     [](const RepeatInterval &r, size_t b) { return r.end <= b; });
+          w.force_raw_alignment = it != changed.end() && it->begin < w.hend;
+          if (!o.polish && !extend && o.cram.empty()) {
+            std::string().swap(w.trace);
+            std::string().swap(w.a.sequence);
+            w.a.shared_sequence.reset();
+          }
+        }
+        memory_stage("repeat refinement complete");
+      }
       std::vector<size_t> prefix(ref.size() + 1);
       std::string draft;
       std::vector<HpSite> realign_sites;
@@ -1166,7 +1210,7 @@ int main(int argc, char **argv) {
             }
             w.a.ops = std::move(ops);
             // Prototype: realign the layout interval when its HPC trace has errors.
-            if (w.trace.find_first_of("XID") != std::string::npos) {
+            if (w.force_raw_alignment || w.trace.find_first_of("XID") != std::string::npos) {
               w.raw_alignment_attempted = true;
               // The lifted HPC trace already aligns these exact raw intervals.
               // Its unit-cost edit count bounds the optimum without imposing

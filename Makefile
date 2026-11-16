@@ -28,10 +28,10 @@ PROJECT_FLAGS = -std=$(CXX_STANDARD) -pthread $(OPENMP_FLAGS) -Isrc \
   -iquote$(VERKKO_SRC)/canu/src/utility/src -iquote$(VERKKO_SRC)/canu/src/stores \
   $(DEP_CFLAGS)
 PROJECT_LIBS = $(VERKKO_LIB) $(DEP_LIBS) -lz -lbz2 -pthread $(OPENMP_LIBS) $(PLATFORM_LIBS)
-SOURCES := core models polish ends offsets hp_refinement io options
+SOURCES := core models polish ends offsets hp_refinement repeat_refinement io options
 OBJECTS := $(addprefix $(BUILD_DIR)/obj/,$(addsuffix .o,$(SOURCES)))
 PROGRAM := $(BUILD_DIR)/bin/hpc-consensus
-TEST_NAMES := core offsets maintenance hp_refinement hp_flanks linked_events ends
+TEST_NAMES := core offsets maintenance hp_refinement hp_flanks linked_events ends repeat_refinement
 TEST_BINS := $(addprefix $(BUILD_DIR)/tests/,$(TEST_NAMES))
 HELPERS := $(BUILD_DIR)/bin/extract-regions $(BUILD_DIR)/bin/apply-run-model
 

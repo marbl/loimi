@@ -411,6 +411,64 @@ Without eligible evidence a run gets length one and is reported as
 `NO_EVIDENCE`; `--missing-run error` instead stops the run. N runs do not collect
 run-length evidence. Fast-mode output preserves the input HPC base sequence.
 
+### Optional repeat run-assignment refinement
+
+Add `--repeat-refine` to enable a separate draft-stage module. It is **off by
+default** and does not require polishing or CRAM output. Its purpose is to
+repair correspondence between neighboring repeat runs before expanding the
+HPC template; it never changes the compressed base order.
+
+The detector scans 32-run windows for two-base enrichment (at least 30 runs)
+or imperfect periods of 2–8 runs (at least 90% agreement). It joins nearby
+windows and requires at least two discordant run calls with depth at least
+three and modal support below 90%. It uses no benchmark coordinates or truth
+sequence. Uniformly wrong, high-confidence calls can therefore be missed.
+
+Detected intervals receive about 1,000 raw bases of context per side. The
+module searches for distinguishing exact 51-base anchors and admits molecules
+containing both anchors uniquely and in order. It scores all admitted reads
+in the first sufficiently covered unique tier; if no unique tier qualifies,
+the existing optional same-tier ambiguity pooling policy applies. Lower tiers
+may propose patterns without automatically winning the final run-length vote.
+
+The original draft and frequent read-supported patterns form a bounded
+candidate pool. If no alternative improves the score, the module tries a
+small number of multi-read raw consensus starts and projects each proposal
+onto the fixed positive-length HPC runs. Candidate acceptance requires both
+an aggregate edit-distance improvement of at least the scoring depth and a
+strict majority of scoring molecules individually preferring it. Ties retain
+the draft. Recalled lengths use the usual tier order, support threshold and
+per-tier models; insufficient local evidence retains the original length.
+Only runs inside the detected repeat are updated. Reads overlapping accepted
+changes are realigned in raw space when polishing or CRAM output is requested.
+
+Work is bounded per window: 6,000 raw bases, 256 spanning placements, eight
+candidates, three starts and two reconstruction rounds by default. Projection
+uses at most 16 million DP cells per call and 64 million cumulatively per
+window. Oversized, excessively deep, unanchorable or unsupported intervals
+retain their original draft calls and receive a diagnostic reason. Overlapping
+windows after an accepted window are skipped in this initial implementation;
+long repeats are not yet split at internal anchors. The detector is linear in
+template length; projection has quadratic worst-case cost within its explicit
+bounds. Read sequence storage is shared and scratch is released per window.
+
+`--repeat-max-window N` and `--repeat-max-reads N` override the corresponding
+admission limits. The window limit includes flanking context and also bounds
+anchored read intervals and candidate sequences. An underexpanded draft may
+fit even when the correct read-supported expansion exceeds this limit. Larger
+limits do not increase the projection-cell budget.
+The optional `PREFIX.repeat-refinement.tsv` records zero-based half-open HPC
+core/window coordinates, status, admitted depth, candidate count, zero-based
+scoring tier, pooling, before/after scores and changed-run count. Pre-refinement
+`--evidence-sites` histograms describe the initial voting; `run-calls.tsv`
+contains the refined calls. A skipped draft interval may still change during
+ordinary downstream polishing, including after realignment of overlapping
+reads changed by another accepted window.
+
+This is an opt-in implementation validated on bounded repeat fixtures, not a
+claim of genome-wide accuracy or haplotype-switch safety. Keep correctly called
+repeat controls and compare the final polished output when testing it.
+
 ### Raw-base polishing and linked events
 
 Enable this stage with `--polish-non-hpc`. Reads are aligned to the expanded
@@ -533,6 +591,9 @@ avoid treating the fixture's artificial opposite edge as a biological end.
 | `--unmatched error\|drop` | error | Policy for eligible reads matching no tier |
 | `--max-error F` | 0.15 | Unit edit-distance cap, rounded up, relative to the longer sequence |
 | `--polish-non-hpc` | off | Enable raw-base correction, HP refinement and end recovery |
+| `--repeat-refine` | off | Automatically detect and refine uncertain repeat run assignments before draft expansion |
+| `--repeat-max-window N` | 6000 | Maximum raw bases admitted per repeat window |
+| `--repeat-max-reads N` | 256 | Maximum spanning placements; skip rather than subsample above this limit |
 | `--hp-flank-bases N` | 500 | Raw query context required for HP observations |
 | `--no-hp-flank-filter` | off | Disable that flank requirement |
 | `--no-hp-realign` | off | Disable default HP refinement during polishing |
@@ -557,6 +618,7 @@ For `--output PREFIX`:
   reads, exact HPC matches, unsupported runs, edits, raw alignment calls, and
   CRAM records. `consensus_reads` counts successful HPC evidence reads even if
   their later raw alignment fails; it need not equal the final CRAM count.
+- With repeat refinement: `PREFIX.repeat-refinement.tsv` (HPC coordinates and acceptance/skip reasons).
 - With correction: `PREFIX.draft.fasta` and `PREFIX.non-hpc-edits.vcf`.
   VCF positions are one-based against the saved **draft**, not the final FASTA.
   Run-call coordinates also remain in draft space after correction.

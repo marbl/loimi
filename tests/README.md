@@ -133,3 +133,20 @@ overhang, default two-molecule extension versus one-molecule rejection and an
 explicit higher support threshold, and tied one-sided boundary endpoints.
 Negative cases preserve inward flank/adjacent-match requirements, interior
 short-read filtering, and two-sided placement ambiguity rejection.
+
+## Optional repeat refinement
+
+`repeat_refinement.cpp` checks automatic detection and rejection of uniform
+calls, positive-run backbone projection and resource limits, synthetic repeat
+correction without supplied target coordinates, read-budget no-change behavior,
+and fallback to a sufficiently covered lower unique tier. Haplotype-conflict
+controls retain or recover six unique higher-tier molecules against 24
+ambiguous or lower-tier molecules, exercise ambiguous-only fallback, and
+retain the draft when unique alleles tie. Large synthetic repeat controls
+exercise 10/12/15-kb limits separately for draft-window admission and for
+anchored read intervals: a severely underexpanded draft can fit while its
+correct supporting read intervals exceed the limit. Both controls remain
+unchanged at 10/12 kb and are corrected at 15 kb. The test is part of
+`make test`. Native HG002 off/on benchmark scripts and large fixtures remain
+outside Git under `hg002-test/native-repeat-module`; their report records
+automatic detection, Q100 accuracy, runtime and child-process peak RSS.

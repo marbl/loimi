@@ -72,6 +72,9 @@ Options parse_options(int argc, char **argv) {
              "--region-flank N      Context in bases/runs (default 100000; region mode only)\n"
              "--evidence-sites FILE  Export all-tier HPC histograms at TIG RUN rows (zero-based)\n"
              "--evidence-read-votes  Also trace per-read evidence at --evidence-sites\n"
+             "--repeat-refine       Optional automatic repeat run-assignment refinement\n"
+             "--repeat-max-window N Maximum raw window bases (default 6000)\n"
+             "--repeat-max-reads N  Maximum spanning placements; skip above (default 256)\n"
              "--hp-flank-bases N    Require N raw query bases and adjacent HPC matches (default "
              "500) on "
              "each side\n"
@@ -134,6 +137,12 @@ Options parse_options(int argc, char **argv) {
       o.evidence_sites = value();
     else if (a == "--evidence-read-votes")
       o.evidence_read_votes = true;
+    else if (a == "--repeat-refine")
+      o.repeat_refine = true;
+    else if (a == "--repeat-max-window")
+      o.repeat_max_window = parse_positive_integer(value());
+    else if (a == "--repeat-max-reads")
+      o.repeat_max_reads = parse_positive_integer(value());
     else if (a == "--hp-realign")
       o.hp_realign = true;
     else if (a == "--no-hp-realign")

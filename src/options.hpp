@@ -13,9 +13,11 @@ struct Options {
   std::string input, templates, output, cram;
   std::string evidence_sites, evidence_exclude_reads;
   bool evidence_read_votes = false; // Opt-in per-placement diagnostic; never changes votes.
-  bool hp_realign = true;           // Rebuild uncertain HP evidence in raw alignments.
-  size_t hp_flank_bases = 500;      // Raw-query flank length; zero disables.
-  bool linked_events = true;        // Group normalization-linked polishing alleles.
+  bool repeat_refine = false;       // Optional bounded repeat correspondence repair.
+  size_t repeat_max_window = 6000, repeat_max_reads = 256;
+  bool hp_realign = true;      // Rebuild uncertain HP evidence in raw alignments.
+  size_t hp_flank_bases = 500; // Raw-query flank length; zero disables.
+  bool linked_events = true;   // Group normalization-linked polishing alleles.
   std::map<std::string, std::string> model_paths;
   std::vector<Tier> tiers;
   unsigned threads = 1, min_support = 5, polish_support = 5;

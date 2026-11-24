@@ -58,7 +58,8 @@ std::string reverse_complement(std::string s) {
   }
   return s;
 }
-std::string align(const std::string &q, const std::string &r, double rate, size_t distance_bound) {
+static std::string align_bounded(const std::string &q, const std::string &r, double rate,
+                                 size_t distance_bound, bool probe) {
   // Most HiFi HPC reads match their supplied interval exactly; avoid edlib then.
   if (q == r)
     return std::string(q.size(), '=');
@@ -66,9 +67,29 @@ std::string align(const std::string &q, const std::string &r, double rate, size_
     throw std::runtime_error("Alignment exceeds edlib limit");
   int k = static_cast<int>(std::ceil(rate * std::max(q.size(), r.size())));
   k = static_cast<int>(std::min<size_t>(k, distance_bound));
-  auto result = merylutil::edlibAlign(
-      q.data(), q.size(), r.data(), r.size(),
-      merylutil::edlibNewAlignConfig(k, merylutil::EDLIB_MODE_NW, merylutil::EDLIB_TASK_PATH));
+  // Edlib's NW traceback depends on the sequences and final minimum distance,
+  // not on the initial search band. A successful smaller search therefore
+  // produces the identical trace. Restrict this extra attempt to <=1/4 of the
+  // original band. Tight bounds keep the original single search; a failed
+  // cheap attempt retries the original cap without changing acceptance.
+  // 64 is edlib's own initial dynamic-search word size, not a biological cutoff.
+  int initial = k;
+  if (probe) {
+    int length_difference = int(std::max(q.size(), r.size()) - std::min(q.size(), r.size()));
+    int cheap = std::max(64, length_difference);
+    if (cheap <= k / 4)
+      initial = cheap;
+  }
+  auto result =
+      merylutil::edlibAlign(q.data(), q.size(), r.data(), r.size(),
+                            merylutil::edlibNewAlignConfig(initial, merylutil::EDLIB_MODE_NW,
+                                                           merylutil::EDLIB_TASK_PATH));
+  if (result.editDistance < 0 && initial != k) {
+    merylutil::edlibFreeAlignResult(result);
+    result = merylutil::edlibAlign(
+        q.data(), q.size(), r.data(), r.size(),
+        merylutil::edlibNewAlignConfig(k, merylutil::EDLIB_MODE_NW, merylutil::EDLIB_TASK_PATH));
+  }
   if (result.editDistance < 0) {
     merylutil::edlibFreeAlignResult(result);
     throw std::runtime_error("Alignment exceeds maximum error rate");
@@ -79,6 +100,13 @@ std::string align(const std::string &q, const std::string &r, double rate, size_
     ops += "=IDX"[result.alignment[i]];
   merylutil::edlibFreeAlignResult(result);
   return ops;
+}
+std::string align(const std::string &q, const std::string &r, double rate, size_t distance_bound) {
+  return align_bounded(q, r, rate, distance_bound, false);
+}
+std::string align_with_bound_probe(const std::string &q, const std::string &r, double rate,
+                                   size_t distance_bound) {
+  return align_bounded(q, r, rate, distance_bound, true);
 }
 std::vector<uint8_t> local_hpc_votes(const std::string &ops, size_t radius, double max_error) {
   if (radius == 0 || !std::isfinite(max_error) || max_error < 0 || max_error > 1)

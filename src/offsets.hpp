@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT-0
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -28,6 +29,30 @@ struct OffsetChoice {
   int tier = -1;            // first decisive tier; lower tiers cannot override it
   size_t repeat_period = 0; // nonzero only for verified periodic-template tie rescue
 };
+// Failure-only template-derived anchors. Bounded terminal probes are retained
+// only when exact and unique in the whole template; each must also occur once
+// in the whole oriented HPC read. Coordinates exclude packaged raw clips.
+struct TemplateOffsetAnchor {
+  size_t begin = 0;
+  std::string sequence;
+};
+std::vector<TemplateOffsetAnchor> template_offset_anchors(const std::string &reference);
+std::vector<int64_t> template_anchor_offsets(const std::string &query,
+                                             const std::vector<TemplateOffsetAnchor> &anchors,
+                                             int64_t layout_begin);
+struct OffsetAnchorRow {
+  std::string molecule;
+  int tier = 0;
+  std::vector<int64_t> offsets;
+};
+// Highest informative tier chooses the origin; lower tiers may corroborate but
+// never move it. Require >=75% agreement and at least required independent
+// molecules, rejecting competing origins and de-duplicating raw/corrected
+// aliases in their highest usable tier.
+// This is proposal support only: the caller must validate complete overlaps.
+OffsetChoice choose_template_anchor_offset(const std::vector<OffsetAnchorRow> &rows,
+                                           size_t required);
+
 // Failure-only joint inference. Scores refer to a fixed predicted query window;
 // an alignment cannot search another repeat copy. Invalid/nonoverlapping scores
 // have overlap == 0. All coordinates and lengths are HPC bases.
@@ -70,6 +95,11 @@ struct BoundaryAlignment;
 BoundaryAlignment align_layout_boundary(const std::string &query, const std::string &reference,
                                         bool left, bool right, size_t predicted_begin,
                                         size_t max_shift, double max_error);
+// Preserve the normal successful boundary alignment. If free-end placement
+// fails (e.g. tied repeat copies), retry only near a marker-validated origin.
+BoundaryAlignment align_marker_boundary(const std::string &query, const std::string &reference,
+                                        bool left, bool right, size_t predicted_begin,
+                                        double max_error);
 // Align an already placed repeat read near its predicted query start. The
 // adjustment is capped below half a repeat to prevent jumps to adjacent copies.
 BoundaryAlignment align_repeat_boundary(const std::string &query, const std::string &reference,
@@ -83,6 +113,17 @@ uint64_t offset_sample_key(uint32_t id);
 // 64 sampled positions. Coordinates and distances are HPC bases.
 std::vector<int64_t> discover_offsets(const std::string &query, const std::string &reference,
                                       int64_t layout_begin, double max_error);
+// Failure-only discovery for a verified whole-template repeat. Optimal tied
+// sequence alignments must differ only by the known repeat period/local drift.
+// Given all known starts of this oriented/clipped read, retain the first/last
+// ACTUAL optimal origins that keep the entire template within the layout.
+// No unbounded locus list is retained; layout_starts must be sorted.
+std::vector<int64_t> discover_periodic_offsets(const std::string &query,
+                                               const std::string &reference,
+                                               const std::vector<int64_t> &layout_starts,
+                                               size_t layout_length, size_t verified_period,
+                                               double max_error);
+
 bool validate_offset_overlap(const std::string &query, const std::string &reference,
                              int64_t layout_begin, int64_t layout_end, int64_t offset,
                              double max_error);

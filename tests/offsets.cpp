@@ -25,6 +25,52 @@ int main() {
   auto reference = sequence.substr(3000, 6000);
   check(discover_offsets("ACGT", "CG", 0, .15).empty());
   check(!validate_offset_overlap("ACGT", "CG", 0, 4, 1, .15));
+  // HG06807 part025/tig48: nearly periodic template with one distinguishing
+  // base. Read-derived long chunks can all miss that marker, while short
+  // template-derived anchors establish the correct copy without softening ties.
+  auto unit = sequence.substr(0, 732);
+  for (char base : std::string("ACGT"))
+    if (base != unit.front() && base != unit[730]) {
+      unit.back() = base;
+      break;
+    }
+  std::string near_repeat;
+  while (near_repeat.size() < 9958)
+    near_repeat += unit;
+  near_repeat.resize(9958);
+  auto exact_repeat = near_repeat;
+  for (char base : std::string("ACGT"))
+    if (base != near_repeat[709] && base != near_repeat[710] && base != near_repeat[711]) {
+      near_repeat[710] = base;
+      break;
+    }
+  check(template_repeat_period(near_repeat) == 0);
+  auto marker_query = sequence.substr(8000, 1024) + near_repeat + sequence.substr(9500, 1024);
+  check(internal_offsets(marker_query, near_repeat, 3000).empty());
+  auto marker_words = template_offset_anchors(near_repeat);
+  check(!marker_words.empty() && marker_words.size() <= 128);
+  check(template_offset_anchors(exact_repeat).empty());
+  auto markers = template_anchor_offsets(marker_query, marker_words, 3000);
+  check(markers == std::vector<int64_t>{4024});
+  check(template_anchor_offsets(marker_query + marker_query, marker_words, 3000).empty());
+  auto marker_choice = choose_template_anchor_offset({{"la", 0, markers}, {"ul", 2, {4013}}}, 2);
+  check(marker_choice.value == 4024 && marker_choice.tier == 0 && marker_choice.support == 2);
+  check(validate_offset_overlap(marker_query, near_repeat, 3000, 3000 + marker_query.size(),
+                                marker_choice.value, .15));
+  auto marker_rejected = [&](const std::vector<OffsetAnchorRow> &rows) {
+    try {
+      choose_template_anchor_offset(rows, 2);
+      return false;
+    } catch (const std::runtime_error &) {
+      return true;
+    }
+  };
+  check(marker_rejected({{"la", 0, {4024, 4024, 4024}}})); // Windows are not molecules.
+  check(marker_rejected({{"alias", 1, {4024}}, {"alias", 2, {4013}}}));
+  check(marker_rejected({{"la", 0, {4024}}, {"ul", 2, {4756}}})); // Wrong repeat copy.
+  check(marker_rejected({{"la", 0, {4024, 4756}}, {"ul", 2, {4024}}}));
+  check(marker_rejected({{"la", 0, {4024}}, {"ul1", 2, {4756}}, {"ul2", 2, {4756}}}));
+  check(choose_template_anchor_offset({{"la", 0, {4024}}}, 1).value == 4024);
   auto anchors = internal_offsets(sequence, reference, 100);
   check(!anchors.empty() &&
         std::all_of(anchors.begin(), anchors.end(), [](int64_t x) { return x == 3100; }));
@@ -107,6 +153,31 @@ int main() {
   tier_rows.push_back({"lao4", 0, true, {{10000, 5}, {}}});
   joint = choose_joint_offset({-810, 59199}, tier_rows);
   check(joint.value == -810 && joint.support == 3 && joint.tier == 0);
+  // Sparse unique-overlap fallback: two placements of one non-unique LA
+  // molecule conflict with a clearly better unique origin. The mixed vote
+  // fails, but the same selector can use the sparse unique subset. Keeping
+  // that selector also means a tied unique read must remain unresolved.
+  std::vector<OffsetRow> sparse_conflict = {
+      {"unique", 0, true, {{6278, 10}, {6278, 48}, {1760, 36}}},
+      {"ambiguous", 0, false, {{5137, 124}, {6278, 0}, {2823, 13}}},
+      {"ambiguous", 0, false, {{}, {6278, 30}, {6278, 0}}}};
+  bool mixed_rejected = false;
+  try {
+    choose_joint_offset({208, 10842, 18826}, sparse_conflict);
+  } catch (const std::runtime_error &) {
+    mixed_rejected = true;
+  }
+  check(mixed_rejected);
+  check(choose_joint_offset({208, 10842, 18826}, {sparse_conflict.front()}).value == 208);
+  auto tied_unique = sparse_conflict.front();
+  tied_unique.scores = {{6278, 10}, {6278, 10}, {}};
+  bool unique_rejected = false;
+  try {
+    choose_joint_offset({208, 10842, 18826}, {tied_unique});
+  } catch (const std::runtime_error &) {
+    unique_rejected = true;
+  }
+  check(unique_rejected);
   // A unanimous informative higher tier wins, including a single molecule.
   joint = choose_joint_offset({3000, 36000}, {{"a", 0, true, {{10000, 5}, {}}},
                                               {"b", 1, true, {{}, {10000, 5}}},
@@ -143,6 +214,46 @@ int main() {
     periodic += motif;
   periodic.resize(5536);
   check(template_repeat_period(periodic) == 971);
+  // Fully periodic templates previously lost every tied proposal before the
+  // repeat-aware selector ran. Retain only actual optimal origins inside the
+  // known layout, not invented phases or unsupported extensions.
+  std::string repeat_query;
+  for (int i = 0; i < 10; ++i)
+    repeat_query += motif;
+  check(discover_offsets(repeat_query, periodic, 0, .15).empty());
+  auto periodic_origins =
+      discover_periodic_offsets(repeat_query, periodic, {0}, repeat_query.size(), 971, .15);
+  check(periodic_origins == std::vector<int64_t>({0, 3884}));
+  auto short_query = motif + motif;
+  check(discover_periodic_offsets(short_query, periodic, {0}, periodic.size(), 971, .15) ==
+        std::vector<int64_t>{0});
+  check(discover_periodic_offsets(short_query, periodic, {5}, periodic.size(), 971, .15).empty());
+  check(
+      discover_periodic_offsets(short_query, periodic, {0}, periodic.size() - 1, 971, .15).empty());
+  auto bad_periodic = periodic;
+  bad_periodic[2700] = bad_periodic[2700] == 'A' ? 'C' : 'A';
+  bool bad_period_rejected = false;
+  try {
+    discover_periodic_offsets(short_query, bad_periodic, {0}, periodic.size(), 971, .15);
+  } catch (const std::invalid_argument &) {
+    bad_period_rejected = true;
+  }
+  check(bad_period_rejected);
+  // Cacheable contained placements have identical target strings after an
+  // exact-period shift. Clipped edge placements must retain separate scores.
+  auto repeat_read = periodic.substr(100, 2000);
+  for (char base : std::string("ACGT"))
+    if (base != repeat_read[499] && base != repeat_read[500] && base != repeat_read[501]) {
+      repeat_read[500] = base;
+      break;
+    }
+  auto first_score = score_offset_overlap_local(repeat_read, periodic, 100, 2100, 0, .15);
+  auto shifted_score = score_offset_overlap_local(repeat_read, periodic, 1071, 3071, 0, .15);
+  check(first_score.overlap && first_score.overlap == shifted_score.overlap &&
+        first_score.edits == shifted_score.edits);
+  auto edge_score = score_offset_overlap_local(repeat_read, periodic, 3984, 5984, 0, .15);
+  check(edge_score.overlap != first_score.overlap);
+
   std::vector<OffsetRow> repeated = {
       {"a", 0, true, {{5536, 11}, {5273, 10}}},  {"b", 0, false, {{5536, 10}, {5536, 8}}},
       {"c", 0, true, {{5536, 14}, {5536, 12}}},  {"d", 0, false, {{5536, 8}, {5536, 10}}},
@@ -191,6 +302,9 @@ int main() {
       auto a = align_repeat_boundary(query, ref, sides.first, sides.second, predicted, period, .15);
       check(a.query_begin == predicted && a.query_end == predicted + ref.size());
       check(a.ops == std::string(ref.size(), '='));
+      auto anchored = align_marker_boundary(query, ref, sides.first, sides.second, predicted, .15);
+      check(anchored.query_begin == predicted && anchored.query_end == predicted + ref.size());
+      check(anchored.ops == std::string(ref.size(), '='));
     }
     // Sequencing indels may adjust the predicted endpoint without moving to
     // an adjacent repeat copy. Validate consumption as well as start position.

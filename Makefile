@@ -31,7 +31,7 @@ PROJECT_LIBS = $(VERKKO_LIB) $(DEP_LIBS) -lz -lbz2 -pthread $(OPENMP_LIBS) $(PLA
 SOURCES := core models polish ends offsets hp_refinement repeat_refinement io options
 OBJECTS := $(addprefix $(BUILD_DIR)/obj/,$(addsuffix .o,$(SOURCES)))
 PROGRAM := $(BUILD_DIR)/bin/hpc-consensus
-TEST_NAMES := core offsets maintenance hp_refinement hp_flanks linked_events ends repeat_refinement
+TEST_NAMES := core offsets maintenance subprocess hp_refinement hp_flanks linked_events ends repeat_refinement
 TEST_BINS := $(addprefix $(BUILD_DIR)/tests/,$(TEST_NAMES))
 HELPERS := $(BUILD_DIR)/bin/extract-regions $(BUILD_DIR)/bin/apply-run-model
 

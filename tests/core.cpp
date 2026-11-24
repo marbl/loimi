@@ -14,6 +14,69 @@ static void check(bool v, const char *msg) {
 }
 int main() {
   {
+    // Composition bounds must preserve the whole canonical NW trace, including
+    // reads whose endpoints lie inside accepted replacements. QV depends on
+    // indel placement, not merely the minimum edit distance.
+    std::mt19937 rng(90417);
+    for (size_t trial = 0; trial < 400; ++trial) {
+      std::string reference;
+      for (size_t i = 0; i < 320; ++i)
+        reference += trial % 2 ? "ACGT"[rng() % 4] : "AAAACG"[i % 6];
+      std::vector<Accepted> edits;
+      for (size_t begin : {size_t(40), size_t(100), size_t(180), size_t(250)}) {
+        size_t length = rng() % 16;
+        std::string alt;
+        for (size_t i = 0, n = rng() % 20; i < n; ++i)
+          alt += "ACGT"[rng() % 4];
+        edits.push_back({{begin, begin + length, alt}, 0, 5, 5});
+      }
+      auto final = hpc::apply(reference, edits);
+      // Exercise crossing, contained, exact-boundary and exterior intervals.
+      size_t begin = trial % 5 == 0 ? 40 : rng() % 280;
+      size_t end = trial % 7 == 0 ? 180 : begin + 1 + rng() % (320 - begin);
+      if (end <= begin)
+        end = begin + 1;
+      std::string query = reference.substr(begin, end - begin);
+      query.insert(query.size() / 2, "AG");
+      if (query.size() > 8)
+        query[3] = query[3] == 'A' ? 'T' : 'A';
+      Alignment a;
+      a.begin = begin;
+      a.end = end;
+      a.ops = align(query, reference.substr(begin, end - begin), 1.0);
+      auto target = final.substr(lift(begin, edits), lift(end, edits) - lift(begin, edits));
+      auto bound = polished_alignment_bound(a, edits);
+      if (target.empty()) {
+        // The vendored edlib API requires a nonempty target. A completely
+        // deleted interval still has a well-defined bound: delete the query.
+        check(bound >= query.size(), "Bound covers a completely deleted interval");
+      } else {
+        auto expected = align(query, target, 1.0);
+        check(align(query, target, 1.0, bound) == expected,
+              "Composed bound preserves canonical trace at edited boundaries");
+      }
+      a.ops = cigar(a.ops);
+      a.packed_ops = true;
+      check(polished_alignment_bound(a, edits) == bound, "Packed and expanded trace bounds agree");
+    }
+    Alignment a;
+    a.begin = 10;
+    a.end = 20;
+    a.ops = "10=";
+    a.packed_ops = true;
+    check(polished_alignment_bound(a, {}) == 0, "Exact trace has zero cost");
+    a.ops = "2X3I4D1=";
+    check(polished_alignment_bound(a, {}) == 9, "All nonmatch bases count");
+    a.ops = "10M";
+    bool rejected = false;
+    try {
+      (void)polished_alignment_bound(a, {});
+    } catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    check(rejected, "Bounds reject unsupported packed trace operations");
+  }
+  {
     // Search bounds must preserve the canonical trace, not just edit distance:
     // repeat indel placement can change downstream polishing evidence.
     std::mt19937 rng(817);
@@ -49,6 +112,39 @@ int main() {
     size_t distance =
         std::count_if(expected.begin(), expected.end(), [](char op) { return op != '='; });
     check(align(q, r, 0.15, distance) == expected, "Long bounded traceback parity");
+    check(align_with_bound_probe(q, r, 0.15, 3000) == expected,
+          "Failed cheap probe falls back to the exact long traceback");
+    r = q;
+    r[127] = r[127] == 'A' ? 'C' : 'A';
+    r.insert(10000, "AC");
+    check(align_with_bound_probe(q, r, 0.15, 3000) == align(q, r, 0.15, 3000),
+          "Successful cheap probe preserves recursive traceback");
+    // Both cheap successes and fallbacks, with repeat-induced optimal ties.
+    for (size_t trial = 0; trial < 150; ++trial) {
+      std::string query, reference;
+      for (size_t i = 0; i < 2048 + 128 * (trial % 17); ++i)
+        query += trial % 2 ? "ACGT"[rng() % 4] : "AAAC"[i % 4];
+      reference = query;
+      for (size_t i = 0, n = trial % 3 == 0 ? 4 : trial % 3 == 1 ? 100 : 600; i < n; ++i) {
+        size_t p = rng() % reference.size();
+        if (i % 3 == 0)
+          reference.erase(p, 1);
+        else if (i % 3 == 1)
+          reference.insert(p, 1, "ACGT"[rng() % 4]);
+        else
+          reference[p] = "ACGT"[rng() % 4];
+      }
+      check(align_with_bound_probe(query, reference, 1.0, 4096) ==
+                align(query, reference, 1.0, 4096),
+            "Bound probe preserves complete repeat/noisy traces");
+    }
+    bool probe_rejected = false;
+    try {
+      (void)align_with_bound_probe(std::string(10000, 'A'), std::string(10000, 'T'), .15, 10000);
+    } catch (const std::runtime_error &) {
+      probe_rejected = true;
+    }
+    check(probe_rejected, "Failed probes cannot loosen the error-rate cutoff");
     bool rejected = false;
     try {
       (void)align("AAAA", "TTTT", 0.1, 4);

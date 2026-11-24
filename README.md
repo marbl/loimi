@@ -253,6 +253,40 @@ available tier. More than 128 candidate loci fails explicitly. Each candidate
 is scored using **global alignment of the layout-predicted query interval**;
 it cannot relocate to a different repeat copy inside an enclosing read.
 
+#### Unique template-marker rescue
+
+If all preceding offset paths fail, the caller probes 128-base words at
+64-base steps in the first and last 4,096 template bases (at most 128 probe
+positions). Only words occurring exactly once in the entire template, with no
+`N`, are retained. A marker must also occur exactly once in the complete
+oriented HPC read. This can recover a short distinguishing variant inside an
+otherwise repetitive template when the long read-derived chunks miss it.
+The probes are built once per failed tig and tested against at most the first
+32 eligible uniquely placed reads; no chromosome-wide index is allocated.
+
+The highest tier with informative markers chooses the origin within the existing
+20-base tolerance. At least two independent molecules must corroborate it,
+with at least 75% agreement and no competing exact origins. Overlapping marker
+windows and corrected/raw aliases do not count as additional molecules. The
+origin must also pass complete predicted-overlap validation on at least three
+independent molecules. Sparse layouts retain their existing one-molecule rule.
+Lower tiers can corroborate but cannot move a higher-tier origin.
+
+This fallback records `TEMPLATE_ANCHOR` in the offset table. Normal successful
+boundary alignments are preserved. A failed free-end alignment (such as tied
+repeat copies) can instead retry within the established 256-HPC-base window
+around the layout-predicted endpoint, using the marker-validated origin.
+Existing successful offset decisions and the exact-repeat tie rules remain
+unchanged; a near-repeat alone is insufficient.
+
+If all other rescues fail in a sparse layout, the final fallback retries the
+joint selector with uniquely placed rows only. A conflicting non-unique read
+must not veto an otherwise decisive unique overlap merely because the unique
+read encloses the template and cannot serve as a whole-read anchor. This uses
+the existing sparse one-molecule allowance and the same competing-locus veto;
+a tied unique read is still unresolved. Its local-overlap origin is reported
+as `LOCAL_LAYOUT`, with the supporting molecule count retained explicitly.
+
 #### Resolving competing offset candidates
 
 Each molecule contributes in its highest tier with usable overlap scores.
@@ -292,6 +326,25 @@ Period discovery tests at most 128 prefix matches and uses no chromosome-sized
 scratch array. This is a deterministic coordinate convention for equivalent
 repeat copies, not evidence that a particular biological copy was identified.
 
+A last failure-only sequence-discovery pass handles globally periodic templates
+whose ordinary discovery rejected every tied hit. Optimal sequence loci must
+all be period-equivalent (with the same established local-drift allowance).
+For each oriented/clipped read, it keeps actual optimal origins compatible
+with placing the complete template inside the known layout. The highest
+proposing tier supplies at most two extrema per independent molecule, so the
+same 64-ID sample still gives at most 128 candidate loci. The existing shared
+molecule/tier scoring and repeat tie selector must then resolve those proposals.
+It does not invent an origin from layout length or relax the exact-period test.
+
+Discovery searches are reused for identical read/orientation/raw-clipping
+queries, translating relative origins for every known placement. In this
+periodic fallback, fully contained placements with identical query strings,
+repeat phase and span also reuse identical overlap scores; clipped edge
+placements retain their separate geometry checks. Every placement remains
+available, and molecule voting is unchanged. A region's unique-only prepass
+must defer this repeat rescue until the complete bounded tier sample is loaded,
+so it cannot choose a lower-tier repeat copy before seeing higher-tier reads.
+
 If these checks still fail, the caller rescans the **same candidate origins**
 with bounded endpoint freedom. Small layout drift can otherwise penalize the
 correct repeat copy simply because predicted clipping endpoints are inexact.
@@ -328,10 +381,13 @@ Unresolved placement or excessive alignment error produces `HPC_ALIGNMENT_FAILED
 run length. The old global `--template-offset` option has been removed.
 `PREFIX.template-offsets.tsv` records offsets, attempts, placements, validation
 support, tolerance, and method (`VALIDATED`, `SPARSE`, `INTERNAL_OVERLAP`,
-`LAYOUT_OVERLAP`, `REPEAT_LAYOUT`, or `SINGLE_READ`). For `LAYOUT_OVERLAP`, placements and
+`LAYOUT_OVERLAP`, `LOCAL_LAYOUT`, `REPEAT_LAYOUT`, `TEMPLATE_ANCHOR`, or
+`SINGLE_READ`). For `LAYOUT_OVERLAP`, placements and
 validation support count supporting molecules, and tolerance reports the
 256-HPC-base proposal span. For `INTERNAL_OVERLAP`, they count supporting reads
 and successful coordinate-constrained overlap checks, not held-out reads.
+For `TEMPLATE_ANCHOR`, placements count independent marker-bearing molecules;
+validation support counts independent complete-overlap checks at that origin.
 With fewer than six eligible reads in a multi-read tig, every eligible read is
 aligned and the available unique placements are clustered without held-out
 validation. At least one placement is required; inconsistent estimates still
@@ -449,8 +505,12 @@ window. Oversized, excessively deep, unanchorable or unsupported intervals
 retain their original draft calls and receive a diagnostic reason. Overlapping
 windows after an accepted window are skipped in this initial implementation;
 long repeats are not yet split at internal anchors. The detector is linear in
-template length; projection has quadratic worst-case cost within its explicit
-bounds. Read sequence storage is shared and scratch is released per window.
+template length. Candidate anchors are matched together in one pass over each
+admitted whole read, including clipped sequence, preserving whole-read
+uniqueness. Matcher storage is bounded by the window's anchors and spanning
+placements; it does not retain a chromosome-wide read index. Projection has
+quadratic worst-case cost within its explicit bounds. Read sequence storage
+is shared and scratch is released per window.
 
 `--repeat-max-window N` and `--repeat-max-reads N` override the corresponding
 admission limits. The window limit includes flanking context and also bounds
@@ -637,6 +697,11 @@ Primary selection is scoped to one invocation; independently produced packages
 must reconcile primary flags when merged. QUAL is unavailable, and AS is negative unit edit
 distance, not an affine-gap score. Failed alignments are omitted and reported.
 References are embedded so decoding does not depend on the temporary FASTA.
+Reads overlapping accepted edits are realigned against the final reference.
+The previous raw alignment plus the intersecting replacements supplies a valid
+upper bound on edit distance, narrowing the search without changing its exact
+optimum, indel placement, or error-rate acceptance. Boundary-crossing edits are
+charged conservatively, and packed traces are counted without expanding them.
 
 Outputs are staged in `PREFIX.work.*`; failures retain this directory for
 diagnosis. Publication of multiple files is not transactional. Keep the CRAM

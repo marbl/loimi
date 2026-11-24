@@ -75,6 +75,84 @@ int64_t internal_offset_cluster(const std::vector<std::vector<int64_t>> &reads, 
       throw std::runtime_error("Competing internal offset anchors");
   return best[(best.size() - 1) / 2];
 }
+std::vector<TemplateOffsetAnchor> template_offset_anchors(const std::string &reference) {
+  // Probe both template ends at a bounded cost, once per failed tig rather
+  // than once per read. Overlapping words may hit the same rare variant; they
+  // are alternative proposals, never independent votes.
+  constexpr size_t width = 128, edge = 4096, stride = 64;
+  std::vector<TemplateOffsetAnchor> result;
+  if (reference.size() < width)
+    return result;
+  std::set<size_t> starts;
+  for (size_t delta = 0; delta < edge && delta <= reference.size() - width; delta += stride) {
+    starts.insert(delta);
+    starts.insert(reference.size() - width - delta);
+  }
+  for (size_t begin : starts) {
+    auto word = reference.substr(begin, width);
+    if (word.find('N') == std::string::npos && reference.find(word) == begin &&
+        reference.find(word, begin + 1) == std::string::npos)
+      result.push_back({begin, std::move(word)});
+  }
+  return result;
+}
+
+std::vector<int64_t> template_anchor_offsets(const std::string &query,
+                                             const std::vector<TemplateOffsetAnchor> &anchors,
+                                             int64_t layout_begin) {
+  std::vector<int64_t> result;
+  for (const auto &anchor : anchors) {
+    auto begin = query.find(anchor.sequence);
+    if (begin != std::string::npos && query.find(anchor.sequence, begin + 1) == std::string::npos)
+      result.push_back(layout_begin + int64_t(begin) - int64_t(anchor.begin));
+  }
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
+OffsetChoice choose_template_anchor_offset(const std::vector<OffsetAnchorRow> &rows,
+                                           size_t required) {
+  std::map<std::string, std::pair<int, std::vector<int64_t>>> molecules;
+  for (const auto &row : rows) {
+    if (row.tier < 0)
+      throw std::invalid_argument("Invalid template-anchor tier");
+    if (row.offsets.empty())
+      continue;
+    auto [it, inserted] = molecules.try_emplace(row.molecule, row.tier, row.offsets);
+    auto &[tier, values] = it->second;
+    if (!inserted && row.tier < tier) {
+      tier = row.tier;
+      values = row.offsets;
+    } else if (!inserted && row.tier == tier)
+      values.insert(values.end(), row.offsets.begin(), row.offsets.end());
+  }
+  if (molecules.empty())
+    throw std::runtime_error("No unique template anchors");
+  int tier = std::numeric_limits<int>::max();
+  for (const auto &[id, row] : molecules)
+    tier = std::min(tier, row.first);
+  std::vector<std::vector<int64_t>> preferred;
+  for (const auto &[id, row] : molecules)
+    if (row.first == tier)
+      preferred.push_back(row.second);
+  constexpr int64_t tolerance = 20;
+  auto candidate = internal_offset_cluster(preferred, 1, tolerance);
+  size_t support = 0;
+  for (const auto &[id, row] : molecules) {
+    support += std::any_of(row.second.begin(), row.second.end(),
+                           [&](int64_t x) { return std::abs(x - candidate) <= tolerance; });
+    // A molecule with a second distant exact origin is not unique evidence,
+    // even if one of its anchor windows also supports this candidate.
+    if (std::any_of(row.second.begin(), row.second.end(),
+                    [&](int64_t x) { return std::abs(x - candidate) > 2 * tolerance; }))
+      throw std::runtime_error("Competing unique template anchors");
+  }
+  if (support < required || support * 4 < molecules.size() * 3)
+    throw std::runtime_error("Insufficient independent unique template anchors");
+  return {candidate, support, molecules.size(), 0, tier, 0};
+}
+
 uint64_t offset_sample_key(uint32_t id) {
   uint64_t x = uint64_t(id) + 0x9e3779b97f4a7c15ULL;
   x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -151,6 +229,51 @@ std::vector<int64_t> discover_offsets(const std::string &q, const std::string &r
       return result;
   }
   return {};
+}
+
+std::vector<int64_t> discover_periodic_offsets(const std::string &q, const std::string &r,
+                                               const std::vector<int64_t> &starts,
+                                               size_t layout_length, size_t period, double rate) {
+  if (period < 2 || template_repeat_period(r) != period)
+    throw std::invalid_argument("Periodic discovery requires a verified whole-template period");
+  if (starts.empty() || layout_length < r.size() || std::min(q.size(), r.size()) < 128 ||
+      q.size() > INT32_MAX || r.size() > INT32_MAX)
+    return {};
+  const bool enclosing = q.size() > r.size();
+  const auto &small = enclosing ? r : q;
+  const auto &large = enclosing ? q : r;
+  auto a = merylutil::edlibAlign(small.data(), small.size(), large.data(), large.size(),
+                                 merylutil::edlibNewAlignConfig(int(std::ceil(rate * small.size())),
+                                                                merylutil::EDLIB_MODE_HW,
+                                                                merylutil::EDLIB_TASK_LOC));
+  auto equivalent = [&](int64_t delta) {
+    size_t distance = size_t(std::abs(delta));
+    if (distance <= size_t(offset_local_span))
+      return true;
+    size_t phase = distance % period;
+    return std::min(phase, period - phase) <= std::min<size_t>(20, period / 4);
+  };
+  bool valid = a.editDistance >= 0 && a.numLocations > 0 && a.startLocations;
+  int64_t lo = INT64_MAX, hi = INT64_MIN;
+  const int64_t trim = int64_t(layout_length - r.size());
+  for (int i = 0; valid && i < a.numLocations; ++i) {
+    valid &= equivalent(int64_t(a.startLocations[i]) - a.startLocations[0]) &&
+             equivalent(int64_t(a.endLocations[i]) - a.endLocations[0]);
+    int64_t relative = enclosing ? a.startLocations[i] : -int64_t(a.startLocations[i]);
+    // Find known placements compatible with whole-template containment. Keep
+    // actual optimal origins without interpolating noisy reads or constructing
+    // a Cartesian product of repetitive query hits and layout placements.
+    auto first = std::lower_bound(starts.begin(), starts.end(), -relative);
+    auto last = std::upper_bound(starts.begin(), starts.end(), trim - relative);
+    if (first != last) {
+      lo = std::min(lo, relative + *first);
+      hi = std::max(hi, relative + *std::prev(last));
+    }
+  }
+  merylutil::edlibFreeAlignResult(a);
+  if (!valid || lo == INT64_MAX)
+    return {};
+  return lo == hi ? std::vector<int64_t>{lo} : std::vector<int64_t>{lo, hi};
 }
 
 OffsetScore score_offset_overlap(const std::string &q, const std::string &r, int64_t begin,
@@ -331,6 +454,17 @@ BoundaryAlignment align_layout_boundary(const std::string &q, const std::string 
   if (best == SIZE_MAX)
     throw std::runtime_error("No boundary alignment near layout prediction");
   return {align(q.substr(begin, end - begin), r, rate), begin, end};
+}
+
+BoundaryAlignment align_marker_boundary(const std::string &query, const std::string &reference,
+                                        bool left, bool right, size_t predicted_begin,
+                                        double max_error) {
+  try {
+    return align_boundary(query, reference, left, right, max_error);
+  } catch (const std::runtime_error &) {
+    return align_layout_boundary(query, reference, left, right, predicted_begin, offset_local_span,
+                                 max_error);
+  }
 }
 
 BoundaryAlignment align_repeat_boundary(const std::string &q, const std::string &r, bool left,

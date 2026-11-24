@@ -21,6 +21,8 @@
 #include <functional>
 #include <iostream>
 #include <iomanip>
+#include <limits>
+#include <tuple>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -134,13 +136,102 @@ struct Offset {
   size_t attempted = 0, placed = 0, validated = 0;
   bool sparse = false;
   bool internal = false;
+  bool template_anchors = false;
   bool layout_rescue = false;
   size_t repeat_period = 0;
   bool local_drift = false;
 };
+using OffsetQueryKey = std::tuple<uint32_t, bool, size_t, size_t>;
+static OffsetQueryKey offset_query_key(const Work &w) {
+  return {w.a.id, w.a.reverse, w.a.clip_left, w.a.clip_right};
+}
+// Last-resort sequence proposals for a globally verified tandem repeat. Keep
+// bounded actual origins, then use the same molecule/tier-aware joint selector.
+static OffsetChoice periodic_offset_choice(const std::vector<Work> &work,
+                                           const std::vector<size_t> &selected,
+                                           const std::string &ref, size_t layout_length,
+                                           size_t period, double max_error) {
+  std::map<std::string, OffsetAnchorRow> proposals;
+  std::map<OffsetQueryKey, std::vector<size_t>> query_groups;
+  for (auto i : selected)
+    query_groups[offset_query_key(work[i])].push_back(i);
+  for (const auto &[key, placements] : query_groups) {
+    const auto &w = work[placements.front()];
+    auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                       w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                 .bases;
+    std::vector<int64_t> starts;
+    for (auto i : placements)
+      starts.push_back(int64_t(work[i].hbegin));
+    std::sort(starts.begin(), starts.end());
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    auto origins = discover_periodic_offsets(q, ref, starts, layout_length, period, max_error);
+    if (origins.empty())
+      continue;
+    int64_t lo = origins.front(), hi = origins.back();
+    auto molecule = offset_molecule(w.a.name, w.a.id);
+    auto [it, inserted] =
+        proposals.try_emplace(molecule, OffsetAnchorRow{molecule, w.a.tier, {lo, hi}});
+    auto &row = it->second;
+    if (!inserted && w.a.tier < row.tier)
+      row = {molecule, w.a.tier, {lo, hi}};
+    else if (!inserted && w.a.tier == row.tier) {
+      row.offsets[0] = std::min(row.offsets[0], lo);
+      row.offsets[1] = std::max(row.offsets[1], hi);
+    }
+  }
+  if (!proposals.empty()) {
+    int tier = std::numeric_limits<int>::max();
+    for (const auto &[id, row] : proposals)
+      tier = std::min(tier, row.tier);
+    std::vector<OffsetEvidence> repeat_evidence;
+    std::vector<int> repeat_tiers;
+    for (const auto &[id, row] : proposals)
+      if (row.tier == tier) {
+        repeat_evidence.push_back({uint32_t(repeat_evidence.size()), false, row.offsets});
+        repeat_tiers.push_back(tier);
+      }
+    auto repeat_candidates = offset_candidates(repeat_evidence, repeat_tiers);
+    std::vector<OffsetRow> repeat_rows;
+    // Fully contained placements shifted by an exact template period score
+    // identical query/reference strings. Cache only that provable case;
+    // clipped edge placements retain their individual alignment checks.
+    using ScoreKey = std::tuple<OffsetQueryKey, size_t, size_t>;
+    std::map<ScoreKey, OffsetScore> score_cache;
+    for (auto i : selected) {
+      const auto &w = work[i];
+      auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                         w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                   .bases;
+      OffsetRow row{offset_molecule(w.a.name, w.a.id), w.a.tier, w.unique, {}};
+      for (auto origin : repeat_candidates) {
+        int64_t b = int64_t(w.hbegin) - origin, e = int64_t(w.hend) - origin;
+        if (b >= 0 && e <= int64_t(ref.size())) {
+          ScoreKey key{offset_query_key(w), size_t(b) % period, size_t(e - b)};
+          auto [it, inserted] = score_cache.try_emplace(key);
+          if (inserted)
+            it->second = score_offset_overlap_local(q, ref, w.hbegin, w.hend, origin, max_error);
+          row.scores.push_back(it->second);
+        } else
+          row.scores.push_back(
+              score_offset_overlap_local(q, ref, w.hbegin, w.hend, origin, max_error));
+      }
+      repeat_rows.push_back(std::move(row));
+    }
+    auto choice = choose_joint_offset(repeat_candidates, repeat_rows, ref);
+    choice.repeat_period = period;
+    std::cerr << "offset rescue: periodic sequence proposals, offset " << choice.value
+              << ", period " << period << ", support " << choice.support << ", candidates "
+              << repeat_candidates.size() << '\n';
+    return choice;
+  }
+  throw std::runtime_error("No supported periodic sequence proposals");
+}
+
+enum class OffsetScope { AllTiers, UniquePrepass };
 static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const std::string &ref,
                            double max_error, size_t eligible_count = SIZE_MAX,
-                           bool rescue_only = false) {
+                           bool rescue_only = false, OffsetScope scope = OffsetScope::AllTiers) {
   std::vector<size_t> seeds;
   for (size_t i = 0; i < work.size(); ++i)
     if (work[i].reason.empty() && work[i].unique)
@@ -253,6 +344,20 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
   std::vector<OffsetEvidence> evidence;
   std::vector<int> evidence_tiers;
   std::vector<size_t> selected;
+  // Discovery depends on sequence/orientation/clipping, not layout placement.
+  // Cache relative origins and translate them for each placement. Repeated IDs
+  // still retain every placement and every score row; no votes are discarded.
+  std::map<OffsetQueryKey, std::vector<int64_t>> discovery_cache;
+  auto relative_origins = [&](const Work &w) -> const std::vector<int64_t> & {
+    auto [it, inserted] = discovery_cache.try_emplace(offset_query_key(w));
+    if (inserted) {
+      auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                         w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                   .bases;
+      it->second = discover_offsets(q, ref, 0, max_error);
+    }
+    return it->second;
+  };
   for (auto &[tier, indices] : tiers) {
     std::set<std::pair<uint64_t, uint32_t>> sample;
     for (auto i : indices) {
@@ -265,10 +370,10 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
       auto &w = work[i];
       if (!sample.count({offset_sample_key(w.a.id), w.a.id}))
         continue;
-      auto q = encode(w.a.bases().substr(w.a.clip_left,
-                                         w.a.bases().size() - w.a.clip_left - w.a.clip_right))
-                   .bases;
-      evidence.push_back({w.a.id, w.unique, discover_offsets(q, ref, w.hbegin, max_error)});
+      auto origins = relative_origins(w);
+      for (auto &origin : origins)
+        origin += int64_t(w.hbegin);
+      evidence.push_back({w.a.id, w.unique, std::move(origins)});
       evidence_tiers.push_back(tier);
       selected.push_back(i);
     }
@@ -323,6 +428,90 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
   } catch (const std::runtime_error &e) {
     std::cerr << "offset joint rescue: " << e.what() << '\n';
   }
+  // Last, sequence-specific rescue for nearly periodic templates: the long
+  // read-derived chunks above can miss a short distinguishing template marker.
+  // Preserve every existing successful offset; run this only after both joint
+  // scoring passes fail. Exact template/read uniqueness is not a softened
+  // repeat-period test, and overlapping marker windows remain one molecule.
+  if (!seeds.empty()) {
+    const auto anchors = template_offset_anchors(ref);
+    std::vector<OffsetAnchorRow> marker_rows;
+    const size_t limit = std::min<size_t>(32, seeds.size());
+    for (size_t j = 0; j < limit && !anchors.empty(); ++j) {
+      const auto &w = work[seeds[j]];
+      auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                         w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                   .bases;
+      marker_rows.push_back({offset_molecule(w.a.name, w.a.id), w.a.tier,
+                             template_anchor_offsets(q, anchors, int64_t(w.hbegin))});
+    }
+    try {
+      auto choice = choose_template_anchor_offset(marker_rows, out.sparse ? 1 : 2);
+      std::set<std::string> validated;
+      for (size_t j = 0; j < limit; ++j) {
+        const auto &w = work[seeds[j]];
+        auto q = encode(w.a.bases().substr(w.a.clip_left,
+                                           w.a.bases().size() - w.a.clip_left - w.a.clip_right))
+                     .bases;
+        if (validate_offset_overlap(q, ref, w.hbegin, w.hend, choice.value, max_error))
+          validated.insert(offset_molecule(w.a.name, w.a.id));
+      }
+      if (validated.size() >= (out.sparse ? 1u : 3u)) {
+        out.value = choice.value;
+        out.internal = true;
+        out.template_anchors = true;
+        out.placed = choice.support;
+        out.validated = validated.size();
+        std::cerr << "offset rescue: unique template anchors, offset " << out.value
+                  << ", anchored molecules " << choice.support << ", tier " << choice.tier
+                  << ", validated overlaps " << out.validated << '\n';
+        return out;
+      }
+    } catch (const std::runtime_error &) {
+      // Keep failing on missing, conflicting or insufficient independent markers.
+    }
+  }
+  // Sparse layouts already permit one uniquely placed whole-read anchor.
+  // An enclosing read may only supply a clipped overlap; do not let a
+  // conflicting non-unique placement veto that same sparse unique evidence.
+  // Keep all preceding successful decisions, and retain the joint selector's
+  // ambiguity veto rather than picking a candidate merely because it is first.
+  if (out.sparse) {
+    std::vector<OffsetRow> unique_rows;
+    for (const auto &row : rows)
+      if (row.unique)
+        unique_rows.push_back(row);
+    try {
+      auto choice = choose_joint_offset(candidates, unique_rows, ref);
+      out.value = choice.value;
+      out.layout_rescue = true;
+      out.local_drift = true; // rows hold the failure-only local-overlap scores.
+      out.attempted = selected.size();
+      out.placed = out.validated = choice.support;
+      std::cerr << "offset rescue: sparse unique overlaps, offset " << out.value
+                << ", supporting molecules " << choice.support << ", tier " << choice.tier << '\n';
+      return out;
+    } catch (const std::runtime_error &) {
+      // Unique evidence can itself be ambiguous; keep that failure explicit.
+    }
+  }
+  // A unique-only regional prepass cannot choose a repeat copy on behalf of
+  // higher-quality non-unique tiers it has not loaded. Defer this last rescue
+  // until the complete bounded per-tier sample is available.
+  if (scope == OffsetScope::AllTiers)
+    if (size_t period = template_repeat_period(ref)) {
+      try {
+        auto choice = periodic_offset_choice(work, selected, ref, layout_length, period, max_error);
+        out.value = choice.value;
+        out.layout_rescue = true;
+        out.repeat_period = choice.repeat_period;
+        out.attempted = selected.size();
+        out.placed = out.validated = choice.support;
+        return out;
+      } catch (const std::runtime_error &) {
+        // Repeat phase alone is not enough: shared read support must resolve it.
+      }
+    }
   throw std::runtime_error(
       "Cannot infer reliable template offset: " + std::to_string(seeds.size()) +
       " unique eligible placements, " + std::to_string(out.attempted) + " initial read attempts, " +
@@ -636,7 +825,8 @@ int main(int argc, char **argv) {
         }
         std::cerr << "tig " << t.tigID() << ": planning region offset\n";
         try {
-          region_offset = infer_offset(seeds, t.length(), template_seq, o.max_error, eligible);
+          region_offset = infer_offset(seeds, t.length(), template_seq, o.max_error, eligible,
+                                       false, OffsetScope::UniquePrepass);
         } catch (const std::runtime_error &) {
           seeds.clear();
           auto rescue = region_rescue_reads(o, occurrences, declared);
@@ -811,12 +1001,13 @@ int main(int argc, char **argv) {
       outputs[".template-offsets.tsv"]
           << name << '\t' << offset << '\t' << inferred.attempted << '\t' << inferred.placed << '\t'
           << inferred.validated << '\t' << (inferred.layout_rescue ? offset_local_span : 20) << '\t'
-          << (inferred.local_drift     ? "LOCAL_LAYOUT"
-              : inferred.repeat_period ? "REPEAT_LAYOUT"
-              : inferred.layout_rescue ? "LAYOUT_OVERLAP"
-              : inferred.internal      ? "INTERNAL_OVERLAP"
-              : inferred.sparse        ? "SPARSE"
-                                       : "VALIDATED")
+          << (inferred.template_anchors ? "TEMPLATE_ANCHOR"
+              : inferred.local_drift    ? "LOCAL_LAYOUT"
+              : inferred.repeat_period  ? "REPEAT_LAYOUT"
+              : inferred.layout_rescue  ? "LAYOUT_OVERLAP"
+              : inferred.internal       ? "INTERNAL_OVERLAP"
+              : inferred.sparse         ? "SPARSE"
+                                        : "VALIDATED")
           << '\n';
       std::cerr << "tig " << name << ": inferred template offset " << offset << " from "
                 << inferred.placed << " reads\n";
@@ -916,6 +1107,10 @@ int main(int argc, char **argv) {
                              ? align_repeat_boundary(w.rle.bases, target, w.boundary_left,
                                                      w.boundary_right, w.predicted_query_begin,
                                                      inferred.repeat_period, o.max_error)
+                         : inferred.template_anchors
+                             ? align_marker_boundary(w.rle.bases, target, w.boundary_left,
+                                                     w.boundary_right, w.predicted_query_begin,
+                                                     o.max_error)
                          : inferred.local_drift
                              ? align_layout_boundary(w.rle.bases, target, w.boundary_left,
                                                      w.boundary_right, w.predicted_query_begin,
@@ -1217,9 +1412,12 @@ int main(int argc, char **argv) {
               // new anchors or changing the accepted maximum error rate.
               size_t bound =
                   std::count_if(w.a.ops.begin(), w.a.ops.end(), [](char op) { return op != '='; });
-              w.a.ops = align(w.a.bases().substr(w.a.clip_left, w.a.bases().size() - w.a.clip_left -
-                                                                    w.a.clip_right),
-                              draft.substr(w.a.begin, w.a.end - w.a.begin), o.max_error, bound);
+              auto query = w.a.bases().substr(w.a.clip_left,
+                                              w.a.bases().size() - w.a.clip_left - w.a.clip_right);
+              auto target = draft.substr(w.a.begin, w.a.end - w.a.begin);
+              w.a.ops = w.force_raw_alignment
+                            ? align_with_bound_probe(query, target, o.max_error, bound)
+                            : align(query, target, o.max_error, bound);
             }
             size_t nm;
             md(w.a, draft, nm);
@@ -1383,6 +1581,10 @@ int main(int argc, char **argv) {
             for (auto &e : edits)
               if (e.edit.begin <= w.a.end && e.edit.end >= w.a.begin)
                 touches = true;
+            // Compose the existing raw trace with the accepted reference edits
+            // before rebasing endpoints. This narrows search only: edlib still
+            // reconstructs its canonical optimum against the final reference.
+            size_t distance_bound = touches ? polished_alignment_bound(w.a, edits) : SIZE_MAX;
             w.a.begin = lift(w.a.begin, edits);
             w.a.end = lift(w.a.end, edits);
             // Coordinate shifts alone suffice only outside edits. A touched read
@@ -1396,7 +1598,7 @@ int main(int argc, char **argv) {
                 w.a.ops =
                     align(w.a.bases().substr(w.a.clip_left,
                                              w.a.bases().size() - w.a.clip_left - w.a.clip_right),
-                          target, o.max_error);
+                          target, o.max_error, distance_bound);
                 w.a.packed_ops = false;
               }
             } catch (const std::bad_alloc &) {

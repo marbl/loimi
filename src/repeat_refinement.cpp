@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT-0
 #include "repeat_refinement.hpp"
+#include "repeat_anchors.hpp"
 #include "align/edlib.H"
 #include <algorithm>
 #include <array>
@@ -272,9 +273,13 @@ refine_repeats(const std::string &backbone, std::vector<Call> &calls, std::vecto
     }
     // Restrict anchors to run boundaries. Then the refined interior maps back
     // to exactly the original run indexes; no partial run can be overwritten.
-    auto anchor = [&](bool first) -> std::pair<size_t, std::string> {
-      std::vector<size_t> best_counts(2 * tiers, 0);
-      size_t best = std::string::npos, next_position = 0;
+    struct AnchorCandidate {
+      size_t position;
+      std::string word;
+    };
+    std::vector<AnchorCandidate> anchors;
+    auto collect_anchors = [&](bool first) {
+      size_t next_position = 0;
       for (size_t p : offsets) {
         if (first ? (p > left / 2 || p + 51 >= draft.size())
                   : (p < draft.size() - right / 2 || p < 51 || p == draft.size()))
@@ -286,25 +291,53 @@ refine_repeats(const std::string &backbone, std::vector<Call> &calls, std::vecto
         auto word = draft.substr(start, 51);
         if (!informative_anchor(word) || unique_at(draft, word) == std::string::npos)
           continue;
-        std::vector<size_t> support(2 * tiers, 0);
-        for (auto r : spanning)
-          if (unique_at(r->alignment->bases(), word) != std::string::npos)
-            ++support.at(size_t(r->alignment->tier) + (r->unique ? 0 : tiers));
-        if (best == std::string::npos || support > best_counts) {
-          best = p;
-          best_counts = std::move(support);
-        }
-        // Fixed stride in raw space bounds anchor scans, independently of run lengths.
+        anchors.push_back({p, std::move(word)});
+        // Preserve the original run-boundary order and valid-anchor stopping
+        // rule. Invalid words still consume the same raw-space stride.
         if (first && p >= 256)
           break;
       }
-      return best == std::string::npos ? std::make_pair(best, std::string())
-                                       : std::make_pair(best, first ? draft.substr(best, 51)
-                                                                    : draft.substr(best - 51, 51));
     };
-    auto [lb, la] = anchor(true);
-    auto [re, ra] = anchor(false);
-    if (lb == std::string::npos || re == std::string::npos || lb + 51 >= re - 51) {
+    collect_anchors(true);
+    size_t left_count = anchors.size();
+    collect_anchors(false);
+    if (!left_count || left_count == anchors.size()) {
+      done("NO_ANCHORS");
+      continue;
+    }
+    std::vector<std::string> words;
+    for (const auto &a : anchors)
+      words.push_back(a.word);
+    repeat_detail::UniqueAnchors matcher(words);
+    std::vector<std::vector<size_t>> positions(
+        words.size(), std::vector<size_t>(spanning.size(), std::string::npos));
+    // One full-read pass finds ALL candidate anchors. Retain their locations
+    // for extraction too, avoiding another search for the two selected words.
+    for (size_t i = 0; i < spanning.size(); ++i) {
+      auto found = matcher.find_unique(spanning[i]->alignment->bases());
+      for (size_t j = 0; j < found.size(); ++j)
+        positions[j][i] = found[j];
+    }
+    auto choose_anchor = [&](size_t begin, size_t end) {
+      std::vector<size_t> best_counts(2 * tiers, 0);
+      size_t best = std::string::npos;
+      for (size_t j = begin; j < end; ++j) {
+        std::vector<size_t> support(2 * tiers, 0);
+        for (size_t i = 0; i < spanning.size(); ++i) {
+          auto r = spanning[i];
+          if (positions[j][i] != std::string::npos)
+            ++support.at(size_t(r->alignment->tier) + (r->unique ? 0 : tiers));
+        }
+        if (best == std::string::npos || support > best_counts) {
+          best = j;
+          best_counts = std::move(support);
+        }
+      }
+      return best;
+    };
+    size_t li = choose_anchor(0, left_count), ri = choose_anchor(left_count, anchors.size());
+    size_t lb = anchors[li].position, re = anchors[ri].position;
+    if (lb + 51 >= re - 51) {
       done("NO_ANCHORS");
       continue;
     }
@@ -315,10 +348,11 @@ refine_repeats(const std::string &backbone, std::vector<Call> &calls, std::vecto
     std::string initial = draft.substr(lb, re - lb), hpc = backbone.substr(b + ib, ie - ib);
     std::vector<Molecule> molecules;
     std::set<uint32_t> used;
-    for (auto r : spanning) {
+    for (size_t i = 0; i < spanning.size(); ++i) {
+      auto r = spanning[i];
       auto &a = *r->alignment;
       auto &s = a.bases();
-      size_t x = unique_at(s, la), y = unique_at(s, ra);
+      size_t x = positions[li][i], y = positions[ri][i];
       if (x == std::string::npos || y == std::string::npos || x + 51 > y ||
           y + 51 - x > cfg.max_window_bases)
         continue;

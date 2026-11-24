@@ -27,6 +27,11 @@ std::string reverse_complement(std::string s);
 // exact sequences. It narrows search only; the error-rate acceptance stays intact.
 std::string align(const std::string &query, const std::string &reference, double max_error,
                   size_t distance_bound = SIZE_MAX);
+// Same exact NW trace and acceptance limit as align(). For repeat-forced raw
+// realignment, try one cheap band when the supplied valid bound is much wider;
+// failure falls back to the original bound. No new placement/consensus rule.
+std::string align_with_bound_probe(const std::string &query, const std::string &reference,
+                                   double max_error, size_t distance_bound);
 // Centered local-quality gate in expanded HPC alignment-operation space.
 // X/I/D all count as errors. Terminal windows are truncated to the trace.
 // Empty means every matching operation is eligible (including exact traces).
@@ -150,6 +155,14 @@ std::vector<Accepted> polish(const std::string &ref, const std::vector<const Ali
                              size_t tiers, uint32_t support, double fraction, size_t max_indel,
                              bool linked_events = true);
 std::string apply(const std::string &ref, const std::vector<Accepted> &edits);
+// Valid upper bound for realigning an existing alignment to the edited reference
+// interval [lift(begin), lift(end)). Count its old unit-cost trace plus the cost
+// of composing every intersecting replacement. Edits must be sorted and disjoint,
+// as required by apply/lift. Boundary-crossing edits and insertions are included
+// conservatively. Does not select a trace or alter the caller's error-rate cap.
+// Reads packed traces directly; no expanded per-base trace is allocated.
+size_t polished_alignment_bound(const Alignment &alignment, const std::vector<Accepted> &edits);
+
 // Map a draft boundary through sorted edits. Points inside a replacement map to
 // its start; a point at an insertion maps after inserted bases. Touching reads
 // must subsequently be realigned, not merely assigned a shifted CIGAR.

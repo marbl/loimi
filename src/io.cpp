@@ -4,10 +4,13 @@
 #include <cctype>
 #include <cerrno>
 #include <fstream>
+#include <spawn.h>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <sys/wait.h>
-#include <unistd.h>
+
+extern char **environ;
 
 namespace hpc {
 namespace {
@@ -49,20 +52,27 @@ void run(std::vector<std::string> args) {
   for (auto &a : args)
     ptr.push_back(a.data());
   ptr.push_back(nullptr);
-  pid_t pid = fork();
-  require(pid >= 0, "fork failed");
-  if (pid == 0) {
-    execvp(ptr[0], ptr.data());
-    perror(ptr[0]);
-    _exit(127);
-  }
+  // The caller can retain a chromosome-sized address space even after its
+  // working buffers are freed. Avoid fork's page-table/commit overhead merely
+  // to exec samtools. Spawn preserves PATH lookup, environment and literal argv.
+  pid_t pid;
+  const int error = posix_spawnp(&pid, ptr[0], nullptr, nullptr, ptr.data(), environ);
+  if (error)
+    throw std::system_error(error, std::generic_category(), "Cannot launch command: " + args[0]);
   int status = 0;
   pid_t waited;
   do {
     waited = waitpid(pid, &status, 0);
   } while (waited < 0 && errno == EINTR);
-  require(waited == pid, "waitpid failed");
-  require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "Command failed: " + args[0]);
+  if (waited < 0)
+    throw std::system_error(errno, std::generic_category(), "Cannot wait for command: " + args[0]);
+  if (WIFSIGNALED(status))
+    throw std::runtime_error("Command killed by signal " + std::to_string(WTERMSIG(status)) + ": " +
+                             args[0]);
+  require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "Command failed: " + args[0] +
+              (WIFEXITED(status) ? " (exit status " + std::to_string(WEXITSTATUS(status)) + ")"
+                                 : " (unexpected process status)"));
 }
 void write_fasta(std::ostream &f, const std::string &name, std::string_view s) {
   f << '>' << name << '\n';

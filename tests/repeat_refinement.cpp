@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT-0
 #include "repeat_refinement.hpp"
+#include "repeat_anchors.hpp"
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
+#include <random>
 using namespace hpc;
 static void check(bool value, int line = __builtin_LINE()) {
   if (!value)
@@ -17,7 +19,57 @@ static std::string random_bases(size_t n) {
   }
   return s;
 }
+static void check_anchor_search() {
+  auto compare = [](const std::string &text, const std::vector<std::string> &words) {
+    repeat_detail::UniqueAnchors matcher(words);
+    auto found = matcher.find_unique(text);
+    check(found.size() == words.size());
+    for (size_t i = 0; i < words.size(); ++i) {
+      size_t p = text.find(words[i]);
+      size_t expected = p != std::string::npos && text.find(words[i], p + 1) == std::string::npos
+                            ? p
+                            : std::string::npos;
+      check(found[i] == expected);
+    }
+  };
+  auto word = random_bases(51);
+  compare("", {word});
+  compare(word, {word, word}); // Duplicate queries and a match at both boundaries.
+  compare(word + "N" + word, {word});
+  compare(word.substr(0, 25) + "N" + word.substr(25), {word});
+  compare(std::string(80, 'A'), {std::string(51, 'A')}); // Overlapping matches.
+  compare(word + "NN" + word + "NN" + word, {word});     // Third match stays nonunique.
+  compare(word, {});
+  std::mt19937 random(1381);
+  for (size_t trial = 0; trial < 500; ++trial) {
+    std::string text;
+    for (size_t i = 0, n = random() % 5001; i < n; ++i)
+      text += "ACGTNacgt"[random() % 9];
+    std::vector<std::string> words;
+    for (size_t j = 0, n = random() % 25; j < n; ++j) {
+      std::string s;
+      for (size_t k = 0; k < 51; ++k)
+        s += "ACGT"[random() % 4];
+      if (random() % 2)
+        text.insert(random() % (text.size() + 1), s);
+      if (random() % 4 == 0)
+        text += s;
+      words.push_back(std::move(s));
+    }
+    compare(text, words);
+  }
+  for (auto invalid : {std::string(50, 'A'), std::string(50, 'A') + "N"}) {
+    bool rejected = false;
+    try {
+      repeat_detail::UniqueAnchors matcher({invalid});
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    check(rejected);
+  }
+}
 int main() {
+  check_anchor_search();
   for (auto q : {"A", "AC", "AAAAC", "ACAC", "ACCA", "CACA"})
     for (auto b : {"A", "AC", "ACA"})
       check(encode(project_repeat_backbone(q, b, 10000)).bases == b);

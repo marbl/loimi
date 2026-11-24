@@ -306,6 +306,47 @@ std::string apply(const std::string &ref, const std::vector<Accepted> &edits) {
   out.append(ref, p, ref.size() - p);
   return out;
 }
+size_t polished_alignment_bound(const Alignment &a, const std::vector<Accepted> &edits) {
+  size_t bound = 0;
+  auto add = [&](size_t cost) { bound = cost > SIZE_MAX - bound ? SIZE_MAX : bound + cost; };
+  if (a.packed_ops) {
+    size_t length = 0;
+    for (char op : a.ops) {
+      if (op >= '0' && op <= '9') {
+        size_t digit = size_t(op - '0');
+        if (length > (SIZE_MAX - digit) / 10)
+          throw std::runtime_error("Packed trace length overflow");
+        length = length * 10 + digit;
+      } else {
+        if (!length || std::string("=XID").find(op) == std::string::npos)
+          throw std::runtime_error("Invalid packed trace");
+        if (op != '=')
+          add(length);
+        length = 0;
+      }
+    }
+    if (length)
+      throw std::runtime_error("Truncated packed trace");
+  } else {
+    for (char op : a.ops) {
+      if (std::string("=XID").find(op) == std::string::npos)
+        throw std::runtime_error("Invalid alignment trace");
+      add(op != '=');
+    }
+  }
+  // A substitution-only replacement followed by the excess insertion/deletion
+  // costs max(old_length, new_length). Composing that path with the old read
+  // alignment gives an upper bound by the edit-distance triangle inequality.
+  // Charging whole boundary-crossing edits also covers lift() snapping a point
+  // inside a replacement to its start. Including endpoint insertions can only
+  // overestimate. Preserve the original NW traceback instead of lifting a path.
+  auto first = std::lower_bound(edits.begin(), edits.end(), a.begin,
+                                [](const Accepted &e, size_t p) { return e.edit.end < p; });
+  for (; first != edits.end() && first->edit.begin <= a.end; ++first)
+    add(std::max(first->edit.end - first->edit.begin, first->edit.alt.size()));
+  return bound;
+}
+
 size_t lift(size_t p, const std::vector<Accepted> &edits) {
   int64_t shift = 0;
   for (const auto &a : edits) {

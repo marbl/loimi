@@ -253,6 +253,19 @@ available tier. More than 128 candidate loci fails explicitly. Each candidate
 is scored using **global alignment of the layout-predicted query interval**;
 it cannot relocate to a different repeat copy inside an enclosing read.
 
+If fixed-endpoint scoring fails, the caller rescans the same candidate
+origins with bounded endpoint freedom. Small layout drift can penalize the
+correct repeat copy when predicted clipping endpoints are inexact.
+This failure-only pass requires at least 1,000 HPC bases of predicted overlap,
+trims up to 256 bases (at most one eighth of the overlap) from each reference
+end, and aligns that core inside the original predicted query overlap. Both
+aligned endpoints must remain within the same local uncertainty window.
+This pass keeps the original molecule counting, tier order, support
+thresholds, and ambiguity checks.
+Successful rescues are recorded as `LOCAL_LAYOUT` in `template-offsets.tsv`
+and `local_drift=1` in the log. They add bounded per-read alignment work only
+for otherwise failing tigs, with no persistent per-read sequence copies.
+
 #### Unique template-marker rescue
 
 If all preceding offset paths fail, the caller probes 128-base words at
@@ -279,8 +292,8 @@ around the layout-predicted endpoint, using the marker-validated origin.
 Existing successful offset decisions and the exact-repeat tie rules remain
 unchanged; a near-repeat alone is insufficient.
 
-If all other rescues fail in a sparse layout, the final fallback retries the
-joint selector with uniquely placed rows only. A conflicting non-unique read
+If a sparse layout is still unresolved, the caller retries the joint selector
+with uniquely placed rows only. A conflicting non-unique read
 must not veto an otherwise decisive unique overlap merely because the unique
 read encloses the template and cannot serve as a whole-read anchor. This uses
 the existing sparse one-molecule allowance and the same competing-locus veto;
@@ -321,42 +334,43 @@ Only equally supported candidates separated by whole repeat units (allowing
 at most 20 HPC bases of phase drift, further capped at one quarter-period) can
 use this fallback. The smallest valid offset wins that tie. A better-supported
 later offset, including one resolved by a later tier, always takes precedence.
-Partially repetitive templates and incompatible repeat phases still fail.
+This tie convention requires full-template periodicity and compatible phases.
 Period discovery tests at most 128 prefix matches and uses no chromosome-sized
 scratch array. This is a deterministic coordinate convention for equivalent
 repeat copies, not evidence that a particular biological copy was identified.
 
-A last failure-only sequence-discovery pass handles globally periodic templates
-whose ordinary discovery rejected every tied hit. Optimal sequence loci must
-all be period-equivalent (with the same established local-drift allowance).
-For each oriented/clipped read, it keeps actual optimal origins compatible
-with placing the complete template inside the known layout. The highest
-proposing tier supplies at most two extrema per independent molecule, so the
-same 64-ID sample still gives at most 128 candidate loci. The existing shared
-molecule/tier scoring and repeat tie selector must then resolve those proposals.
-It does not invent an origin from layout length or relax the exact-period test.
+If the ordinary candidate scores, unique template markers, and sparse unique
+overlaps all fail, a shared sequence rescue carries competing optimal alignment
+locations forward. A read's tied locations are hypotheses. The caller scores
+them against the predicted overlap windows of all sampled placements, counting
+each molecule once and keeping the configured tier order and error limit.
+Bounded endpoint adjustment is used from the start of this rescue. If the
+whole-sequence hypotheses do not resolve, the caller also tries proposals from
+pairs of separated, template-unique 64- or 32-base anchors.
 
-Discovery searches are reused for identical read/orientation/raw-clipping
-queries, translating relative origins for every known placement. In this
-periodic fallback, fully contained placements with identical query strings,
-repeat phase and span also reuse identical overlap scores; clipped edge
-placements retain their separate geometry checks. Every placement remains
-available, and molecule voting is unchanged. A region's unique-only prepass
-must defer this repeat rescue until the complete bounded tier sample is loaded,
-so it cannot choose a lower-tier repeat copy before seeing higher-tier reads.
+For non-equivalent loci, the rescue first requires three supporting molecules,
+a within-tier majority, and a resolved locus. If at most five molecules provide
+usable alignments, two supporters suffice when they beat every distant
+alternative. One supporting molecule requires a unique placement and at most
+two sampled molecules. Only that molecule may be informative and no distant
+locus may receive a vote. The rescue caps work at 4,096 origins and 65,536
+hit/placement pairs per query and 128 coalesced loci per pass. If a pass exceeds a cap it reports
+the limit instead of truncating the competitor set.
 
-If these checks still fail, the caller rescans the **same candidate origins**
-with bounded endpoint freedom. Small layout drift can otherwise penalize the
-correct repeat copy simply because predicted clipping endpoints are inexact.
-This failure-only pass requires at least 1,000 HPC bases of predicted overlap,
-trims up to 256 bases (at most one eighth of the overlap) from each reference
-end, and aligns that core inside the original predicted query overlap. Both
-aligned endpoints must remain within the same local uncertainty window.
-It applies the same molecule counting, tier order, majority, and ambiguity
-checks; it does not lower voting thresholds or search the rest of a long read.
-Successful rescues are recorded as `LOCAL_LAYOUT` in `template-offsets.tsv`
-and `local_drift=1` in the log. They add bounded per-read alignment work only
-for otherwise failing tigs, with no persistent per-read sequence copies.
+For a verified globally periodic template, the same rescue first compresses
+equivalent optimal matches to the actual first and last origins that keep the
+whole template inside the layout. The highest proposing tier supplies at most
+two extrema per independent molecule. The existing joint scoring and
+exact-repeat tie convention apply, preserving the established offset and
+boundary alignment for these tigs. If this representation cannot resolve the
+offset, the short-anchor retry uses the full bounded locus set and requires
+the read support to distinguish competing loci.
+
+Discovery is shared by placements with the same read, orientation and raw
+clipping. For exact repeats, fully contained placements with identical query
+strings, repeat phase and span also reuse identical overlap scores. Clipped
+edge placements retain separate geometry checks. Regional runs defer the
+shared rescue until the complete bounded tier sample is available.
 
 #### Boundary reads and small tigs
 

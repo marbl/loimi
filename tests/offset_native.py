@@ -120,7 +120,7 @@ with tempfile.TemporaryDirectory(prefix='hpc-offset-') as temporary:
                 'offset joint rescue: offset=3000' in log or
                 'offset rescue: unique template anchors, offset 3000' in log or
                 'offset rescue: sparse unique overlaps, offset 208' in log or
-                'offset rescue: periodic sequence proposals, offset 732' in log), log
+                'offset rescue: shared sequence proposals, offset 732' in log), log
         observed = ''.join(s for s in (root/(label+'.fasta')).read_text().splitlines()
                            if not s.startswith('>'))
         expected = (reference * 4 + reference_e + reference_f if label in ('full', 'unique_only') else
@@ -130,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix='hpc-offset-') as temporary:
         if label == 'sparse_unique':
             assert 'offset rescue: sparse unique overlaps, offset 208' in log, log
         if label == 'periodic':
-            assert 'offset rescue: periodic sequence proposals, offset 732' in log, log
+            assert 'offset rescue: shared sequence proposals, offset 732' in log, log
             assert 'REPEAT_LAYOUT' in (root/(label+'.template-offsets.tsv')).read_text()
         if label in ('full', 'unique_only', 'zero_unique', 'sparse_tiers'):
             methods = (root/(label+'.template-offsets.tsv')).read_text()

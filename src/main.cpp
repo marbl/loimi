@@ -145,12 +145,12 @@ using OffsetQueryKey = std::tuple<uint32_t, bool, size_t, size_t>;
 static OffsetQueryKey offset_query_key(const Work &w) {
   return {w.a.id, w.a.reverse, w.a.clip_left, w.a.clip_right};
 }
-// Last-resort sequence proposals for a globally verified tandem repeat. Keep
-// bounded actual origins, then use the same molecule/tier-aware joint selector.
-static OffsetChoice periodic_offset_choice(const std::vector<Work> &work,
+// Compare tied sequence loci using the layout-predicted read windows.
+// Exact repeats may compress equivalent hypotheses to the established extrema.
+static OffsetChoice sequence_offset_choice(const std::vector<Work> &work,
                                            const std::vector<size_t> &selected,
                                            const std::string &ref, size_t layout_length,
-                                           size_t period, double max_error) {
+                                           size_t period, double max_error, bool short_anchors) {
   std::map<std::string, OffsetAnchorRow> proposals;
   std::map<OffsetQueryKey, std::vector<size_t>> query_groups;
   for (auto i : selected)
@@ -165,34 +165,42 @@ static OffsetChoice periodic_offset_choice(const std::vector<Work> &work,
       starts.push_back(int64_t(work[i].hbegin));
     std::sort(starts.begin(), starts.end());
     starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
-    auto origins = discover_periodic_offsets(q, ref, starts, layout_length, period, max_error);
+    auto origins =
+        discover_rescue_offsets(q, ref, starts, layout_length, period, max_error, short_anchors);
     if (origins.empty())
       continue;
-    int64_t lo = origins.front(), hi = origins.back();
     auto molecule = offset_molecule(w.a.name, w.a.id);
-    auto [it, inserted] =
-        proposals.try_emplace(molecule, OffsetAnchorRow{molecule, w.a.tier, {lo, hi}});
+    if (period)
+      origins = {origins.front(), origins.back()};
+    auto [it, inserted] = proposals.try_emplace(molecule, OffsetAnchorRow{molecule, w.a.tier, {}});
     auto &row = it->second;
-    if (!inserted && w.a.tier < row.tier)
-      row = {molecule, w.a.tier, {lo, hi}};
-    else if (!inserted && w.a.tier == row.tier) {
-      row.offsets[0] = std::min(row.offsets[0], lo);
-      row.offsets[1] = std::max(row.offsets[1], hi);
+    if (inserted || w.a.tier < row.tier) {
+      row.tier = w.a.tier;
+      row.offsets = std::move(origins);
+    } else if (w.a.tier == row.tier) {
+      if (period) {
+        row.offsets[0] = std::min(row.offsets[0], origins.front());
+        row.offsets[1] = std::max(row.offsets[1], origins.back());
+      } else {
+        row.offsets.insert(row.offsets.end(), origins.begin(), origins.end());
+        std::sort(row.offsets.begin(), row.offsets.end());
+        row.offsets.erase(std::unique(row.offsets.begin(), row.offsets.end()), row.offsets.end());
+      }
     }
   }
   if (!proposals.empty()) {
     int tier = std::numeric_limits<int>::max();
     for (const auto &[id, row] : proposals)
       tier = std::min(tier, row.tier);
-    std::vector<OffsetEvidence> repeat_evidence;
-    std::vector<int> repeat_tiers;
+    std::vector<OffsetEvidence> evidence;
+    std::vector<int> tiers;
     for (const auto &[id, row] : proposals)
-      if (row.tier == tier) {
-        repeat_evidence.push_back({uint32_t(repeat_evidence.size()), false, row.offsets});
-        repeat_tiers.push_back(tier);
+      if (!period || row.tier == tier) {
+        evidence.push_back({uint32_t(evidence.size()), false, row.offsets});
+        tiers.push_back(row.tier);
       }
-    auto repeat_candidates = offset_candidates(repeat_evidence, repeat_tiers);
-    std::vector<OffsetRow> repeat_rows;
+    auto candidates = offset_candidates(evidence, tiers);
+    std::vector<OffsetRow> rows;
     // Fully contained placements shifted by an exact template period score
     // identical query/reference strings. Cache only that provable case;
     // clipped edge placements retain their individual alignment checks.
@@ -204,9 +212,9 @@ static OffsetChoice periodic_offset_choice(const std::vector<Work> &work,
                                          w.a.bases().size() - w.a.clip_left - w.a.clip_right))
                    .bases;
       OffsetRow row{offset_molecule(w.a.name, w.a.id), w.a.tier, w.unique, {}};
-      for (auto origin : repeat_candidates) {
+      for (auto origin : candidates) {
         int64_t b = int64_t(w.hbegin) - origin, e = int64_t(w.hend) - origin;
-        if (b >= 0 && e <= int64_t(ref.size())) {
+        if (period && b >= 0 && e <= int64_t(ref.size())) {
           ScoreKey key{offset_query_key(w), size_t(b) % period, size_t(e - b)};
           auto [it, inserted] = score_cache.try_emplace(key);
           if (inserted)
@@ -216,16 +224,19 @@ static OffsetChoice periodic_offset_choice(const std::vector<Work> &work,
           row.scores.push_back(
               score_offset_overlap_local(q, ref, w.hbegin, w.hend, origin, max_error));
       }
-      repeat_rows.push_back(std::move(row));
+      rows.push_back(std::move(row));
     }
-    auto choice = choose_joint_offset(repeat_candidates, repeat_rows, ref);
+    auto choice = choose_joint_offset(candidates, rows, ref,
+                                      period ? OffsetSupportPolicy::Established
+                                             : OffsetSupportPolicy::SparseRescue);
     choice.repeat_period = period;
-    std::cerr << "offset rescue: periodic sequence proposals, offset " << choice.value
-              << ", period " << period << ", support " << choice.support << ", candidates "
-              << repeat_candidates.size() << '\n';
+    std::cerr << "offset rescue: shared sequence proposals, offset " << choice.value << ", period "
+              << period << ", support " << choice.support << "/" << choice.informative
+              << ", runner-up " << choice.runner_up << ", tier " << choice.tier << ", candidates "
+              << candidates.size() << ", short_anchors " << short_anchors << '\n';
     return choice;
   }
-  throw std::runtime_error("No supported periodic sequence proposals");
+  throw std::runtime_error("No supported sequence proposals");
 }
 
 enum class OffsetScope { AllTiers, UniquePrepass };
@@ -495,23 +506,28 @@ static Offset infer_offset(std::vector<Work> &work, size_t layout_length, const 
       // Unique evidence can itself be ambiguous; keep that failure explicit.
     }
   }
-  // A unique-only regional prepass cannot choose a repeat copy on behalf of
-  // higher-quality non-unique tiers it has not loaded. Defer this last rescue
-  // until the complete bounded per-tier sample is available.
-  if (scope == OffsetScope::AllTiers)
-    if (size_t period = template_repeat_period(ref)) {
+  // The regional prepass has not loaded competing placements and tiers.
+  // Make this final decision only with the complete bounded sample.
+  if (scope == OffsetScope::AllTiers) {
+    size_t period = template_repeat_period(ref);
+    // Preserve verified repeat compression first, then try the full bounded
+    // locus set. Short chains are useful only when the initial loci fail.
+    for (bool short_anchors : {false, true}) {
       try {
-        auto choice = periodic_offset_choice(work, selected, ref, layout_length, period, max_error);
+        auto choice = sequence_offset_choice(work, selected, ref, layout_length,
+                                             short_anchors ? 0 : period, max_error, short_anchors);
         out.value = choice.value;
         out.layout_rescue = true;
+        out.local_drift = !choice.repeat_period;
         out.repeat_period = choice.repeat_period;
         out.attempted = selected.size();
         out.placed = out.validated = choice.support;
         return out;
-      } catch (const std::runtime_error &) {
-        // Repeat phase alone is not enough: shared read support must resolve it.
+      } catch (const std::runtime_error &e) {
+        std::cerr << "offset sequence rescue: " << e.what() << '\n';
       }
     }
+  }
   throw std::runtime_error(
       "Cannot infer reliable template offset: " + std::to_string(seeds.size()) +
       " unique eligible placements, " + std::to_string(out.attempted) + " initial read attempts, " +

@@ -105,6 +105,60 @@ int main() {
                                               {"ul1", 1, true, {{41045, 371}, {41045, 508}}},
                                               {"ul2", 1, true, {{}, {41045, 1696}}}});
   check(joint.value == 66363 && joint.support == 2 && joint.informative == 3);
+  // Part008/tig562: competing offsets look good to individual reads,
+  // but bounded overlaps across all molecules resolve the later candidate.
+  const auto rescue_policy = OffsetSupportPolicy::SparseRescue;
+  const std::vector<int64_t> rescue_loci = {11170, 13360, 14823};
+  const std::vector<OffsetRow> rescue_rows = {{"a", 0, true, {{3621, 1}, {3621, 2}, {3067, 4}}},
+                                              {"b", 0, true, {{3621, 1}, {3621, 1}, {3621, 4}}},
+                                              {"c", 0, true, {{3621, 13}, {3621, 4}, {3621, 5}}}};
+  joint = choose_joint_offset(rescue_loci, rescue_rows, {}, rescue_policy);
+  check(joint.value == 13360 && joint.support == 3 && joint.runner_up == 2);
+  auto sparse_rescue = [&](const std::vector<OffsetRow> &rows, size_t support) {
+    try {
+      return choose_joint_offset({3000, 36000}, rows, {}, rescue_policy).support == support;
+    } catch (const std::runtime_error &) {
+      return support == 0;
+    }
+  };
+  check(sparse_rescue({{"a", 0, true, {{10000, 5}, {}}}, {"b", 1, true, {{10000, 5}, {}}}}, 2));
+  check(sparse_rescue({{"a", 0, true, {{10000, 5}, {}}}}, 1));
+  check(sparse_rescue({{"a", 0, false, {{10000, 5}, {}}}}, 0));
+  check(sparse_rescue({{"a", 0, true, {{10000, 5}, {10000, 5}}}}, 0));
+  check(sparse_rescue({{"a", 0, true, {{10000, 5}, {}}},
+                       {"a", 1, true, {{10000, 5}, {}}},
+                       {"b", 1, true, {{}, {10000, 5}}}},
+                      0));
+  check(sparse_rescue(
+      {{"a", 0, true, {{10000, 5}, {10000, 5}}}, {"b", 0, true, {{10000, 5}, {10000, 5}}}}, 0));
+  // A nonperiodic template may occur several times in an enclosing read.
+  // Ordinary discovery rejects that read. Shared discovery keeps both loci.
+  auto nonperiodic_repeat = reference + sequence.substr(0, 1000) + reference;
+  check(template_repeat_period(reference) == 0);
+  check(discover_offsets(nonperiodic_repeat, reference, 0, .15).empty());
+  check(discover_rescue_offsets(nonperiodic_repeat, reference, {0}, nonperiodic_repeat.size(), 0,
+                                .15) ==
+        std::vector<int64_t>({0, int64_t(reference.size() + 1000)}));
+  // The short-anchor retry can propose a partial overlap when the whole
+  // shorter sequence has no admissible match.
+  auto short_overlap_read = sequence.substr(0, 5400);
+  check(
+      discover_rescue_offsets(short_overlap_read, reference, {0}, short_overlap_read.size(), 0, .15)
+          .empty());
+  check(discover_rescue_offsets(short_overlap_read, reference, {0}, short_overlap_read.size(), 0,
+                                .15, true) == std::vector<int64_t>{3000});
+  // Do not truncate the competitor set to make an over-budget query resolve.
+  std::vector<int64_t> many_starts;
+  for (int64_t begin = 0; begin <= 4096; ++begin)
+    many_starts.push_back(begin);
+  bool budget_rejected = false;
+  try {
+    (void)discover_rescue_offsets(nonperiodic_repeat, reference, many_starts,
+                                  nonperiodic_repeat.size() + 4096, 0, .15);
+  } catch (const std::runtime_error &) {
+    budget_rejected = true;
+  }
+  check(budget_rejected);
   // Uninformative molecules cannot veto a unanimous informative tier.
   for (size_t n = 1; n <= 8; ++n)
     for (size_t supporters = 1; supporters <= n; ++supporters) {
@@ -222,19 +276,18 @@ int main() {
     repeat_query += motif;
   check(discover_offsets(repeat_query, periodic, 0, .15).empty());
   auto periodic_origins =
-      discover_periodic_offsets(repeat_query, periodic, {0}, repeat_query.size(), 971, .15);
+      discover_rescue_offsets(repeat_query, periodic, {0}, repeat_query.size(), 971, .15);
   check(periodic_origins == std::vector<int64_t>({0, 3884}));
   auto short_query = motif + motif;
-  check(discover_periodic_offsets(short_query, periodic, {0}, periodic.size(), 971, .15) ==
+  check(discover_rescue_offsets(short_query, periodic, {0}, periodic.size(), 971, .15) ==
         std::vector<int64_t>{0});
-  check(discover_periodic_offsets(short_query, periodic, {5}, periodic.size(), 971, .15).empty());
-  check(
-      discover_periodic_offsets(short_query, periodic, {0}, periodic.size() - 1, 971, .15).empty());
+  check(discover_rescue_offsets(short_query, periodic, {5}, periodic.size(), 971, .15).empty());
+  check(discover_rescue_offsets(short_query, periodic, {0}, periodic.size() - 1, 971, .15).empty());
   auto bad_periodic = periodic;
   bad_periodic[2700] = bad_periodic[2700] == 'A' ? 'C' : 'A';
   bool bad_period_rejected = false;
   try {
-    discover_periodic_offsets(short_query, bad_periodic, {0}, periodic.size(), 971, .15);
+    discover_rescue_offsets(short_query, bad_periodic, {0}, periodic.size(), 971, .15);
   } catch (const std::invalid_argument &) {
     bad_period_rejected = true;
   }

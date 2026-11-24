@@ -27,7 +27,7 @@ struct OffsetChoice {
   int64_t value = 0;
   size_t support = 0, informative = 0, runner_up = 0;
   int tier = -1;            // first decisive tier; lower tiers cannot override it
-  size_t repeat_period = 0; // nonzero only for verified periodic-template tie rescue
+  size_t repeat_period = 0; // nonzero for verified periodic-template rescue
 };
 // Failure-only template-derived anchors. Bounded terminal probes are retained
 // only when exact and unique in the whole template; each must also occur once
@@ -83,9 +83,11 @@ OffsetScore score_offset_overlap_local(const std::string &query, const std::stri
 // its highest usable tier; repeated placements and corrected/raw UUID aliases
 // cannot increase independent support. Inconclusive tiers fall through; throws
 // if no tier has sufficient corroboration, majority support and a resolved locus.
+enum class OffsetSupportPolicy { Established, SparseRescue };
 OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
                                  const std::vector<OffsetRow> &rows,
-                                 const std::string &reference = {});
+                                 const std::string &reference = {},
+                                 OffsetSupportPolicy policy = OffsetSupportPolicy::Established);
 // Verify an exact period spanning at least two copies over the ENTIRE template.
 // Bounded candidate search; returns zero when no period is proven.
 size_t template_repeat_period(const std::string &reference);
@@ -113,16 +115,14 @@ uint64_t offset_sample_key(uint32_t id);
 // 64 sampled positions. Coordinates and distances are HPC bases.
 std::vector<int64_t> discover_offsets(const std::string &query, const std::string &reference,
                                       int64_t layout_begin, double max_error);
-// Failure-only discovery for a verified whole-template repeat. Optimal tied
-// sequence alignments must differ only by the known repeat period/local drift.
-// Given all known starts of this oriented/clipped read, retain the first/last
-// ACTUAL optimal origins that keep the entire template within the layout.
-// No unbounded locus list is retained; layout_starts must be sorted.
-std::vector<int64_t> discover_periodic_offsets(const std::string &query,
-                                               const std::string &reference,
-                                               const std::vector<int64_t> &layout_starts,
-                                               size_t layout_length, size_t verified_period,
-                                               double max_error);
+// Retain tied sequence origins for cross-read scoring. A verified nonzero
+// period enables the established exact-repeat compression to actual extrema.
+// Otherwise all actual origins are kept within a fixed budget, or discovery
+// fails explicitly. Layout starts must be sorted.
+std::vector<int64_t> discover_rescue_offsets(const std::string &query, const std::string &reference,
+                                             const std::vector<int64_t> &layout_starts,
+                                             size_t layout_length, size_t verified_period,
+                                             double max_error, bool short_anchors = false);
 
 bool validate_offset_overlap(const std::string &query, const std::string &reference,
                              int64_t layout_begin, int64_t layout_end, int64_t offset,

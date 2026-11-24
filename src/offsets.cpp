@@ -160,6 +160,43 @@ uint64_t offset_sample_key(uint32_t id) {
   return x ^ (x >> 31);
 }
 
+// Two separated, template-unique exact chunks establish a candidate origin.
+static std::vector<int64_t> chained_offsets(const std::string &q, const std::string &r,
+                                            int64_t begin, size_t max_width, size_t min_width) {
+  for (size_t width = std::min(max_width, r.size() / 4); width >= min_width; width /= 2) {
+    if (q.size() < 2 * width)
+      continue;
+    size_t samples = std::min<size_t>(64, 1 + (q.size() - width + width / 2 - 1) / (width / 2));
+    std::vector<std::pair<int64_t, size_t>> points;
+    for (size_t i = 0; i < samples; ++i) {
+      size_t qb = (q.size() - width) * i / (samples - 1);
+      auto chunk = q.substr(qb, width);
+      if (chunk.find('N') != std::string::npos)
+        continue;
+      size_t hit = r.find(chunk);
+      if (hit != std::string::npos && r.find(chunk, hit + 1) == std::string::npos)
+        points.emplace_back(begin + int64_t(qb) - int64_t(hit), qb);
+    }
+    std::sort(points.begin(), points.end());
+    std::vector<int64_t> result;
+    for (size_t i = 0; i < points.size(); ++i) {
+      size_t j = i, lo = points[i].second, hi = lo;
+      while (j < points.size() && points[j].first - points[i].first <= 20) {
+        lo = std::min(lo, points[j].second);
+        hi = std::max(hi, points[j].second);
+        ++j;
+      }
+      if (hi - lo >= width)
+        result.push_back(points[i + (j - i - 1) / 2].first);
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    if (!result.empty())
+      return result;
+  }
+  return {};
+}
+
 std::vector<int64_t> discover_offsets(const std::string &q, const std::string &r, int64_t begin,
                                       double rate) {
   // This rescue establishes an origin from sequence, not just layout geometry.
@@ -197,47 +234,17 @@ std::vector<int64_t> discover_offsets(const std::string &q, const std::string &r
   // Sparse partial overlaps can contain several good shorter anchors but no
   // two 2-kb anchors separated by 2 kb. Try smaller exact chunks only when
   // the stronger chain fails. Every proposal still needs fixed-overlap scoring.
-  for (size_t width = std::min<size_t>(2000, r.size() / 4); width >= 128; width /= 2) {
-    if (q.size() < 2 * width)
-      continue;
-    size_t samples = std::min<size_t>(64, 1 + (q.size() - width + width / 2 - 1) / (width / 2));
-    std::vector<std::pair<int64_t, size_t>> points;
-    for (size_t i = 0; i < samples; ++i) {
-      size_t qb = (q.size() - width) * i / (samples - 1);
-      auto chunk = q.substr(qb, width);
-      if (chunk.find('N') != std::string::npos)
-        continue;
-      size_t hit = r.find(chunk);
-      if (hit != std::string::npos && r.find(chunk, hit + 1) == std::string::npos)
-        points.emplace_back(begin + int64_t(qb) - int64_t(hit), qb);
-    }
-    std::sort(points.begin(), points.end());
-    std::vector<int64_t> result;
-    for (size_t i = 0; i < points.size(); ++i) {
-      size_t j = i, lo = points[i].second, hi = lo;
-      while (j < points.size() && points[j].first - points[i].first <= 20) {
-        lo = std::min(lo, points[j].second);
-        hi = std::max(hi, points[j].second);
-        ++j;
-      }
-      if (hi - lo >= width)
-        result.push_back(points[i + (j - i - 1) / 2].first);
-    }
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
-    if (!result.empty())
-      return result;
-  }
-  return {};
+  return chained_offsets(q, r, begin, 2000, 128);
 }
 
-std::vector<int64_t> discover_periodic_offsets(const std::string &q, const std::string &r,
-                                               const std::vector<int64_t> &starts,
-                                               size_t layout_length, size_t period, double rate) {
-  if (period < 2 || template_repeat_period(r) != period)
+std::vector<int64_t> discover_rescue_offsets(const std::string &q, const std::string &r,
+                                             const std::vector<int64_t> &starts,
+                                             size_t layout_length, size_t period, double rate,
+                                             bool short_anchors) {
+  if (period && (period < 2 || template_repeat_period(r) != period))
     throw std::invalid_argument("Periodic discovery requires a verified whole-template period");
-  if (starts.empty() || layout_length < r.size() || std::min(q.size(), r.size()) < 128 ||
-      q.size() > INT32_MAX || r.size() > INT32_MAX)
+  if (starts.empty() || (period && layout_length < r.size()) ||
+      std::min(q.size(), r.size()) < 128 || q.size() > INT32_MAX || r.size() > INT32_MAX)
     return {};
   const bool enclosing = q.size() > r.size();
   const auto &small = enclosing ? r : q;
@@ -255,22 +262,55 @@ std::vector<int64_t> discover_periodic_offsets(const std::string &q, const std::
   };
   bool valid = a.editDistance >= 0 && a.numLocations > 0 && a.startLocations;
   int64_t lo = INT64_MAX, hi = INT64_MIN;
-  const int64_t trim = int64_t(layout_length - r.size());
-  for (int i = 0; valid && i < a.numLocations; ++i) {
-    valid &= equivalent(int64_t(a.startLocations[i]) - a.startLocations[0]) &&
-             equivalent(int64_t(a.endLocations[i]) - a.endLocations[0]);
+  // The general case also permits a template overhang, as the ordinary
+  // overlap scorer does. Keep all actual hypotheses within the work limit.
+  constexpr size_t max_query_origins = 4096;
+  constexpr int64_t min_overlap = 1000;
+  const int64_t template_length = int64_t(r.size());
+  const int64_t first_origin = period ? 0 : min_overlap - template_length;
+  const int64_t last_origin =
+      period ? int64_t(layout_length) - template_length : int64_t(layout_length) - min_overlap;
+  std::set<int64_t> origins;
+  // Bound even duplicate hit/placement pairs, which may not grow the set.
+  size_t remaining_pairs = 65536;
+  bool over_budget = false;
+  auto add_origin = [&](int64_t origin) {
+    origins.insert(origin);
+    over_budget = --remaining_pairs == 0 || origins.size() > max_query_origins;
+  };
+  for (int i = 0; valid && !over_budget && i < a.numLocations; ++i) {
+    if (period)
+      valid &= equivalent(int64_t(a.startLocations[i]) - a.startLocations[0]) &&
+               equivalent(int64_t(a.endLocations[i]) - a.endLocations[0]);
     int64_t relative = enclosing ? a.startLocations[i] : -int64_t(a.startLocations[i]);
     // Find known placements compatible with whole-template containment. Keep
     // actual optimal origins without interpolating noisy reads or constructing
     // a Cartesian product of repetitive query hits and layout placements.
-    auto first = std::lower_bound(starts.begin(), starts.end(), -relative);
-    auto last = std::upper_bound(starts.begin(), starts.end(), trim - relative);
-    if (first != last) {
+    auto first = std::lower_bound(starts.begin(), starts.end(), first_origin - relative);
+    auto last = std::upper_bound(starts.begin(), starts.end(), last_origin - relative);
+    if (first_origin > last_origin || first == last)
+      continue;
+    if (!period) {
+      while (first != last && !over_budget)
+        add_origin(relative + *first++);
+    } else {
       lo = std::min(lo, relative + *first);
       hi = std::max(hi, relative + *std::prev(last));
     }
   }
   merylutil::edlibFreeAlignResult(a);
+  if (!period && r.size() >= size_t(min_overlap) && short_anchors && !over_budget) {
+    // Short chains add hypotheses missed by the best whole-overlap matches.
+    // They use the same strict downstream scoring and never vote themselves.
+    for (auto relative : chained_offsets(q, r, 0, 64, 32))
+      for (auto first = std::lower_bound(starts.begin(), starts.end(), first_origin - relative);
+           first != starts.end() && *first <= last_origin - relative && !over_budget; ++first)
+        add_origin(relative + *first);
+  }
+  if (over_budget)
+    throw std::runtime_error("Offset rescue exceeds the per-query origin budget");
+  if (!period)
+    return {origins.begin(), origins.end()};
   if (!valid || lo == INT64_MAX)
     return {};
   return lo == hi ? std::vector<int64_t>{lo} : std::vector<int64_t>{lo, hi};
@@ -477,7 +517,8 @@ BoundaryAlignment align_repeat_boundary(const std::string &q, const std::string 
 }
 
 OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
-                                 const std::vector<OffsetRow> &rows, const std::string &reference) {
+                                 const std::vector<OffsetRow> &rows, const std::string &reference,
+                                 OffsetSupportPolicy policy) {
   const size_t n = candidates.size();
   if (!n || rows.empty())
     throw std::runtime_error("No joint offset candidates");
@@ -544,7 +585,8 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
   // A three-molecule sample may contain one outlier, just as four/five-read
   // samples already can. Keep the existing minimum unchanged for every other
   // sample size; tier agreement and competing-candidate checks still apply.
-  size_t required = std::min<size_t>(3, molecules.size() / 2 + 1);
+  const bool adaptive = policy == OffsetSupportPolicy::SparseRescue;
+  size_t required = adaptive ? 3 : std::min<size_t>(3, molecules.size() / 2 + 1);
   size_t total = 0;
   for (auto [tier, count] : informative)
     total += count;
@@ -556,7 +598,8 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
   // First preserve all evidence-based decisions, including a decisive later
   // tier. Only if every tier is unresolved may repeat equivalence break a tie.
   size_t period = 0;
-  for (unsigned rescue = 0; rescue < 2; ++rescue) {
+  for (unsigned pass = 0; pass < 2; ++pass) {
+    const bool rescue = pass && !adaptive;
     if (rescue) {
       period = template_repeat_period(reference);
       if (!period)
@@ -580,7 +623,8 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
       size_t runner = 0;
       bool tied = false;
       for (size_t i = 0; i < n; ++i)
-        if (i != best && std::abs(candidates[i] - candidates[best]) > 2 * offset_local_span) {
+        if (i != best && std::abs(candidates[i] - candidates[best]) >
+                             (adaptive ? offset_local_span : 2 * offset_local_span)) {
           runner = std::max(runner, support[i]);
           if (compare(i, best) == 0) {
             size_t distance = std::abs(candidates[i] - candidates[best]);
@@ -597,11 +641,20 @@ OffsetChoice choose_joint_offset(const std::vector<int64_t> &candidates,
       // no usable alignment. Keep the distant-candidate ambiguity veto: one read
       // supporting two repeat copies is not a resolved unanimous vote.
       bool unanimous = votes[tier][best] == informative[tier];
-      if ((support[best] >= required || unanimous) && majority && !tied)
+      bool enough = support[best] >= required || (!adaptive && unanimous);
+      // Reduce the floor only after no tier passes the ordinary three-vote
+      // requirement. Sparse decisions must beat distant alternatives across
+      // tiers, and the one-molecule case requires a unique layout placement.
+      if (adaptive && pass)
+        enough = total <= 5 && runner < support[best] &&
+                 (support[best] >= 2 ||
+                  (total == 1 && molecules.size() <= 2 && unique_votes[tier][best] == 1));
+      if (enough && majority && !tied)
         return {candidates[best], support[best], total, runner, tier, period};
       rejected << " tier=" << tier << " candidate=" << candidates[best]
                << " tier_support=" << votes[tier][best] << "/" << informative[tier]
-               << " support=" << support[best] << " required=" << required
+               << " support=" << support[best]
+               << " required=" << (adaptive && pass ? (total == 1 ? 1 : 2) : required)
                << " runner_up=" << runner << " tied=" << tied << " majority=" << majority << ";";
     }
   }
